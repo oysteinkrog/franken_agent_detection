@@ -221,6 +221,8 @@ struct Parser {
     depth: usize,
     /// What is left of the structure pool (see `POOL_DEPTH`).
     pool_left: usize,
+    /// The budget each allowance starts with.
+    keep_bytes: usize,
 }
 
 impl Parser {
@@ -317,7 +319,31 @@ impl Parser {
             if src.next()? != b':' {
                 return Err(Stop::Invalid);
             }
-            if keep {
+            if keep && top_level && key == "message" {
+                // The message is what gets indexed: it gets allowances of its
+                // own, so fields before it (such as a huge toolUseResult)
+                // can never spend them.
+                let saved = (
+                    self.budget_left,
+                    self.extra_left,
+                    self.pool_left,
+                    self.values_left,
+                );
+                self.budget_left = self.keep_bytes;
+                self.extra_left = self.keep_bytes;
+                self.pool_left = POOL_BYTES;
+                self.values_left = MAX_KEPT_VALUES;
+                self.reserve = true;
+                let value = self.value(src, depth + 1);
+                self.reserve = false;
+                (
+                    self.budget_left,
+                    self.extra_left,
+                    self.pool_left,
+                    self.values_left,
+                ) = saved;
+                map.insert(key, value?);
+            } else if keep {
                 self.reserve = top_level;
                 let value = self.value(src, depth + 1);
                 self.reserve = false;
@@ -572,6 +598,7 @@ pub(crate) fn parse_long_line<R: BufRead>(
         cut_keys: 0,
         depth: 0,
         pool_left: POOL_BYTES,
+        keep_bytes,
     };
     // A byte order mark may start the line, as in the buffered path.
     let parsed = (|| {
@@ -671,12 +698,12 @@ mod tests {
             panic!("not parsed");
         };
         assert_eq!(truncated_strings, 1);
-        // "user" uses 4 of the 6,001 bytes; the content keeps 2,998 whole
-        // two-byte characters of the 5,997 bytes left.
+        // The message has its own 6,001 bytes; the content keeps 3,000 whole
+        // two-byte characters.
         let content = value["message"]["content"].as_str().unwrap();
-        assert!(content.starts_with(&"é".repeat(2998)));
+        assert!(content.starts_with(&"é".repeat(3000)));
         assert!(
-            content.ends_with(&truncation_marker(5996, 10_000)),
+            content.ends_with(&truncation_marker(6000, 10_000)),
             "{content}"
         );
         // Short strings after the long one are still kept whole.
@@ -738,7 +765,9 @@ mod tests {
 
     #[test]
     fn message_content_survives_when_the_allowances_are_spent() {
-        let filler = vec![format!(r#""{}""#, "f".repeat(4000)); 50].join(",");
+        // Enough filler to spend the budget, the extra allowance and the
+        // whole structure pool before the message.
+        let filler = vec![format!(r#""{}""#, "f".repeat(4000)); 400].join(",");
         let line = format!(
             r#"{{"toolUseResult":[{filler}],"message":{{"role":"user","content":[{{"type":"text","text":"hello"}}]}},"timestamp":"t"}}"#
         );
@@ -874,7 +903,7 @@ mod tests {
         };
         let content = value["message"]["content"].as_str().unwrap();
         assert!(content.len() < (1 << 20) + 100);
-        assert!(content.ends_with(&truncation_marker((1 << 20) - 4, 64 << 20)));
+        assert!(content.ends_with(&truncation_marker(1 << 20, 64 << 20)));
         assert_eq!(consumed, (64u64 << 20) + 37 + 4);
         assert!(tail.len() <= 8192 && tail.ends_with(b"\"}}\n"));
     }
