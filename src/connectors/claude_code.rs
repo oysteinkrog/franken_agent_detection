@@ -834,32 +834,12 @@ struct ClaudeJsonlOutcome {
     tail: Option<SourceTailState>,
 }
 
-/// Metadata key on a part that continues a session emitted before (a later
-/// part of the same parse, or a tail scan): the index of its first message.
-/// A host may store such a part as a plain append when its archive already
-/// holds the session up to the index before; the first part never has it.
-pub const CONTINUES_FROM_IDX_KEY: &str = "continuesFromIdx";
-
 fn claude_jsonl_part(
     identity: &ClaudeJsonlIdentity<'_>,
     state: &ClaudeSessionState,
     json_title: Option<&String>,
     messages: Vec<NormalizedMessage>,
-    continues_from_idx: Option<i64>,
 ) -> NormalizedConversation {
-    let mut metadata = serde_json::json!({
-        "source": "claude_code",
-        "sessionId": state.session_id,
-        "cliSessionId": Option::<String>::None,
-        "gitBranch": state.git_branch,
-        "permissionMode": Option::<String>::None,
-        "bodyAvailable": true,
-        "sidechain": identity.is_subagent_transcript,
-        "parentSessionId": identity.parent_session_id
-    });
-    if let Some(first_idx) = continues_from_idx {
-        metadata[CONTINUES_FROM_IDX_KEY] = Value::from(first_idx);
-    }
     NormalizedConversation {
         agent_slug: "claude_code".into(),
         external_id: identity.external_id.clone(),
@@ -868,7 +848,16 @@ fn claude_jsonl_part(
         source_path: identity.path.to_path_buf(),
         started_at: state.started_at,
         ended_at: state.ended_at,
-        metadata,
+        metadata: serde_json::json!({
+            "source": "claude_code",
+            "sessionId": state.session_id,
+            "cliSessionId": Option::<String>::None,
+            "gitBranch": state.git_branch,
+            "permissionMode": Option::<String>::None,
+            "bodyAvailable": true,
+            "sidechain": identity.is_subagent_transcript,
+            "parentSessionId": identity.parent_session_id
+        }),
         messages,
     }
 }
@@ -1005,7 +994,6 @@ fn parse_claude_jsonl_source(
      -> Result<()> {
         let mut messages = std::mem::take(&mut parser.messages);
         parser.content_bytes = 0;
-        let continues_from_idx = (*next_idx > 0).then_some(*next_idx);
         for (i, message) in messages.iter_mut().enumerate() {
             message.idx = next_idx.saturating_add(i64::try_from(i).unwrap_or(i64::MAX));
         }
@@ -1013,13 +1001,7 @@ fn parse_claude_jsonl_source(
         conversations_emitted += 1;
         messages_emitted += messages.len();
         let json_title = part_title.map_or(parser.state.json_title.as_ref(), Option::as_ref);
-        on_conversation(claude_jsonl_part(
-            identity,
-            &parser.state,
-            json_title,
-            messages,
-            continues_from_idx,
-        ))
+        on_conversation(claude_jsonl_part(identity, &parser.state, json_title, messages))
     };
 
     let mut line = Vec::new();
@@ -3400,19 +3382,12 @@ mod tests {
         for (i, key) in joined.iter().enumerate() {
             assert_eq!(key.0, i as i64, "idx is continuous across parts");
         }
-        for (i, part) in parts.iter().enumerate() {
+        for part in &parts {
             assert!(part.messages.len() <= 4);
             assert_eq!(part.external_id, one_shot.external_id);
             assert_eq!(part.source_path, one_shot.source_path);
             assert_eq!(part.workspace, one_shot.workspace);
-            let mut metadata = part.metadata.clone();
-            let continues = metadata.as_object_mut().unwrap().remove(CONTINUES_FROM_IDX_KEY);
-            assert_eq!(metadata, one_shot.metadata);
-            if i == 0 {
-                assert!(continues.is_none(), "the first part is a plain new session");
-            } else {
-                assert_eq!(continues, Some(Value::from(part.messages[0].idx)));
-            }
+            assert_eq!(part.metadata, one_shot.metadata);
             assert_eq!(
                 part.title.as_deref(),
                 Some("Late title"),
@@ -3484,13 +3459,7 @@ mod tests {
         assert_eq!(parts[0].title, full[0].title, "title carried from the earlier scan");
         assert_eq!(parts[0].started_at, full[0].started_at);
         assert_eq!(parts[0].ended_at, full[0].ended_at);
-        let mut metadata = parts[0].metadata.clone();
-        assert_eq!(
-            metadata.as_object_mut().unwrap().remove(CONTINUES_FROM_IDX_KEY),
-            Some(Value::from(7)),
-            "a tail scan continues the stored session"
-        );
-        assert_eq!(metadata, full[0].metadata);
+        assert_eq!(parts[0].metadata, full[0].metadata);
         let tail2 = completion(&second).tail.clone().unwrap();
         assert!(tail2.resumed);
         assert_eq!(tail2.next_idx, 10);
