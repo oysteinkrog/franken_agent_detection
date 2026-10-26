@@ -152,6 +152,7 @@ fn assert_source_boundaries(connector: &CodexConnector, ctx: &ScanContext, expec
         let mut hooks = SourceScanHooks {
             should_scan_source: Some(&mut should_scan),
             on_source_complete: Some(&mut on_complete),
+            tail_resume: None,
         };
         connector
             .scan_with_source_boundaries(ctx, &mut hooks, &mut |conversation| {

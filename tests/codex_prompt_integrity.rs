@@ -102,6 +102,7 @@ fn assert_all_routes(records: &[Value], expected: &[&str]) {
                 let mut hooks = SourceScanHooks {
                     should_scan_source: None,
                     on_source_complete: Some(&mut complete),
+                    tail_resume: None,
                 };
                 connector
                     .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {

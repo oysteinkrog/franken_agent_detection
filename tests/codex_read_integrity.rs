@@ -55,6 +55,7 @@ fn assert_rejected(ctx: &ScanContext, kind: io::ErrorKind) {
     let mut hooks = SourceScanHooks {
         should_scan_source: None,
         on_source_complete: Some(&mut complete),
+        tail_resume: None,
     };
     let error = connector
         .scan_with_source_boundaries(ctx, &mut hooks, &mut |_| {
@@ -98,6 +99,7 @@ fn incomplete_tail_and_invalid_utf8_withhold_all_routes_then_retry() {
         let mut hooks = SourceScanHooks {
             should_scan_source: None,
             on_source_complete: Some(&mut complete),
+            tail_resume: None,
         };
         let mut conversations = Vec::new();
         CodexConnector::new()
@@ -181,6 +183,7 @@ fn snapshot_mutations_fail_before_emission_and_stable_retry_succeeds() {
         let mut hooks = SourceScanHooks {
             should_scan_source: None,
             on_source_complete: Some(&mut complete),
+            tail_resume: None,
         };
         let error = CodexConnector::new()
             .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_| {
@@ -218,6 +221,7 @@ fn host_veto_precedes_parsing_and_sink_errors_still_abort() {
     let mut hooks = SourceScanHooks {
         should_scan_source: Some(&mut predicate),
         on_source_complete: Some(&mut complete),
+        tail_resume: None,
     };
     CodexConnector::new()
         .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_| {
