@@ -553,6 +553,8 @@ impl ClaudeChunkLimits {
 thread_local! {
     static TEST_MAX_LINE_BYTES: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    static TEST_LONG_LINE_KEEP_BYTES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
     static TEST_CHUNK_LIMITS: std::cell::Cell<Option<ClaudeChunkLimits>> =
         const { std::cell::Cell::new(None) };
 }
@@ -893,12 +895,27 @@ fn parse_claude_jsonl_line(bytes: &[u8]) -> Option<Value> {
     serde_json::from_str::<Value>(line.trim_start_matches('\u{feff}')).ok()
 }
 
-/// Longest JSONL line the parser buffers, `FAD_CLAUDE_MAX_LINE_BYTES` to
-/// override. Real Claude Code lines stay under about 9 MB; a parsed line costs
-/// about nine times its size downstream (200 MiB measured at 1.9 GiB), so the
-/// default keeps one line near 2.3 GiB. A source with a longer line stops
-/// before that line, with a warning, instead of growing without bound.
-const DEFAULT_MAX_LINE_BYTES: usize = 256 * 1024 * 1024;
+/// Longest JSONL line the parser buffers whole, `FAD_CLAUDE_MAX_LINE_BYTES` to
+/// override. Real Claude Code lines stay under about 9 MB, and a buffered line
+/// costs about nine times its size downstream (200 MiB measured at 1.9 GiB).
+/// A longer line is parsed by streaming instead (see `long_jsonl_line`): it
+/// keeps up to `FAD_CLAUDE_LONG_LINE_KEEP_BYTES` (16 MiB) of its string data,
+/// marks each cut string, and parsing goes on with the next line, so no
+/// message is dropped.
+const DEFAULT_MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_LONG_LINE_KEEP_BYTES: usize = 16 * 1024 * 1024;
+
+fn long_line_keep_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(keep) = TEST_LONG_LINE_KEEP_BYTES.with(std::cell::Cell::get) {
+        return keep;
+    }
+    dotenvy::var("FAD_CLAUDE_LONG_LINE_KEEP_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_LONG_LINE_KEEP_BYTES)
+}
 
 fn max_line_bytes() -> usize {
     #[cfg(test)]
@@ -915,7 +932,8 @@ fn max_line_bytes() -> usize {
 /// Read one line (with its newline) into `line`, buffering at most `cap`
 /// bytes. Returns the bytes consumed and whether the line was longer than
 /// `cap`. A longer line is consumed to its end without being kept when
-/// `skip_long` is set; otherwise reading stops at the cap.
+/// `skip_long` is set; otherwise reading stops at the cap, `line` holds the
+/// bytes consumed so far, and the rest of the line is still in `reader`.
 fn read_line_capped<R: std::io::BufRead>(
     reader: &mut R,
     line: &mut Vec<u8>,
@@ -936,10 +954,10 @@ fn read_line_capped<R: std::io::BufRead>(
         if !too_long {
             if line.len() + take > cap {
                 too_long = true;
-                *line = Vec::new();
                 if !skip_long {
                     return Ok((consumed, true));
                 }
+                *line = Vec::new();
             } else {
                 line.extend_from_slice(&buf[..take]);
             }
@@ -1139,13 +1157,61 @@ fn parse_claude_jsonl_source(
         line.clear();
         let read = match read_line_capped(&mut reader, &mut line, max_line, false) {
             Ok((_, true)) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    offset,
-                    max_line_bytes = max_line,
-                    "claude_code line longer than FAD_CLAUDE_MAX_LINE_BYTES; stopping this source before it"
-                );
-                break;
+                // Too long to buffer: stream the rest of it, keeping a
+                // bounded part of its text, then go on with the next line.
+                let keep = long_line_keep_bytes();
+                let mut tail_bytes = Vec::new();
+                let mut rest = std::io::Read::chain(&line[..], &mut reader);
+                match super::long_jsonl_line::parse_long_line(
+                    &mut rest,
+                    keep,
+                    &mut tail_bytes,
+                    SOURCE_TAIL_PREFIX_BYTES,
+                ) {
+                    super::long_jsonl_line::LongLine::Parsed {
+                        value,
+                        consumed,
+                        truncated_strings,
+                    } => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            offset,
+                            line_bytes = consumed,
+                            kept_bytes = keep,
+                            truncated_strings,
+                            "claude_code line longer than FAD_CLAUDE_MAX_LINE_BYTES; indexed with its text cut"
+                        );
+                        offset += consumed;
+                        if options.wants_tail {
+                            push_tail_prefix(&mut prefix, &tail_bytes);
+                        }
+                        parser.ingest_line(value);
+                    }
+                    super::long_jsonl_line::LongLine::Invalid { consumed } => {
+                        offset += consumed;
+                        if options.wants_tail {
+                            push_tail_prefix(&mut prefix, &tail_bytes);
+                        }
+                        continue;
+                    }
+                    // A line still being written: leave it for the next scan.
+                    super::long_jsonl_line::LongLine::Incomplete => break,
+                }
+                if parser.messages.len() >= options.limits.max_messages
+                    || parser.content_bytes >= options.limits.max_content_bytes
+                {
+                    if part_title.is_none() {
+                        let remaining = start.saturating_add(readable).saturating_sub(offset);
+                        part_title = Some(scan_final_ai_title(
+                            path,
+                            offset,
+                            remaining,
+                            parser.state.json_title.clone(),
+                        ));
+                    }
+                    emit(&mut parser, part_title.as_ref(), &mut next_idx)?;
+                }
+                continue;
             }
             Ok((read, false)) => read,
             Err(error) => {
@@ -3701,31 +3767,59 @@ mod tests {
     }
 
     #[test]
-    fn a_line_longer_than_the_cap_stops_the_source_before_it() {
+    fn a_line_longer_than_the_cap_is_indexed_cut_and_the_session_goes_on() {
         let dir = TempDir::new().unwrap();
         let claude_dir = make_test_claude_dir(dir.path());
         let session = claude_dir.join("session.jsonl");
-        let mut lines: Vec<String> = (0..3).map(session_line).collect();
-        let long =
-            session_line(3).replacen("number 3", &format!("number 3 {}", "x".repeat(8192)), 1);
-        lines.push(long);
-        lines.push(session_line(4));
+        let mut lines: Vec<String> = (0..6).map(session_line).collect();
+        let body = "x".repeat(300_000);
+        lines[3] = session_line(3).replacen("number 3", &format!("number 3 {body}"), 1);
         write_session(&session, &lines);
+        let one_shot = ClaudeCodeConnector::new()
+            .scan(&ScanContext::local_default(claude_dir.clone(), None))
+            .unwrap();
 
         TEST_MAX_LINE_BYTES.with(|cap| cap.set(Some(4096)));
+        TEST_LONG_LINE_KEEP_BYTES.with(|keep| keep.set(Some(8192)));
         let events = scan_events(&claude_dir, |_| None);
         TEST_MAX_LINE_BYTES.with(|cap| cap.set(None));
-        let tail = completion(&events).tail.clone().unwrap();
-        let before_long: usize = lines[..3].iter().map(|l| l.len() + 1).sum();
-        assert_eq!(
-            tail.offset, before_long as u64,
-            "stops before the long line"
-        );
-        assert_eq!(tail.next_idx, 3);
+        TEST_LONG_LINE_KEEP_BYTES.with(|keep| keep.set(None));
 
-        // With the default cap the same file parses in full.
-        let events = scan_events(&claude_dir, |_| None);
-        assert_eq!(completion(&events).tail.clone().unwrap().next_idx, 5);
+        let messages: Vec<&NormalizedMessage> = parts(&events)
+            .iter()
+            .flat_map(|part| part.messages.iter())
+            .collect();
+        assert_eq!(
+            messages.len(),
+            6,
+            "every message, including those after the long line"
+        );
+        for (i, message) in messages.iter().enumerate() {
+            assert_eq!(message.idx, i as i64);
+        }
+        let cut = &messages[3].content;
+        assert!(cut.starts_with("message number 3 xxx"));
+        assert!(
+            cut.contains("[truncated while indexing: kept "),
+            "{}",
+            &cut[cut.len() - 80..]
+        );
+        assert!(cut.len() < 9000);
+        // The other messages are as a one-shot parse stores them.
+        for i in [0, 1, 2, 4, 5] {
+            assert_eq!(
+                message_key(messages[i]),
+                message_key(&one_shot[0].messages[i])
+            );
+        }
+        let tail = completion(&events).tail.clone().unwrap();
+        assert_eq!(tail.offset, fs::metadata(&session).unwrap().len());
+        assert_eq!(tail.next_idx, 6);
+        assert_eq!(
+            &tail.prefix[..],
+            &fs::read(&session).unwrap()[tail.offset as usize - tail.prefix.len()..],
+            "the tail prefix covers the end of the long line"
+        );
     }
 
     #[test]

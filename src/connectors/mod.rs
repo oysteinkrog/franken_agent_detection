@@ -32,6 +32,7 @@ pub mod grok_bot;
 pub mod hermes;
 pub mod kimi;
 pub mod kiro;
+mod long_jsonl_line;
 pub mod muse;
 pub mod omp;
 pub mod openclaw;
