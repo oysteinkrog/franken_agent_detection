@@ -13,8 +13,16 @@
 use serde_json::{Map, Number, Value};
 use std::io::BufRead;
 
-/// Deepest nesting accepted before the line is treated as invalid.
-const MAX_DEPTH: usize = 512;
+/// Deepest nesting accepted before the line is treated as invalid. The same
+/// limit as `serde_json`, which parses every shorter line.
+const MAX_DEPTH: usize = 128;
+
+/// Values (objects, arrays, scalars) kept per line. Later ones are read and
+/// dropped, so a line of millions of tiny values stays bounded.
+const MAX_KEPT_VALUES: usize = 1_000_000;
+
+/// Longest number token kept as a number; a longer one is kept as text.
+const MAX_NUMBER_BYTES: usize = 4096;
 
 /// Strings up to this size are always kept whole (keys, types, timestamps),
 /// whatever is left of the budget.
@@ -29,6 +37,8 @@ pub(crate) enum LongLine {
         value: Value,
         consumed: u64,
         truncated_strings: usize,
+        /// Values read and dropped past the per-line limits.
+        dropped_values: usize,
     },
     /// Not valid JSON. The rest of the line was consumed (`consumed` bytes
     /// in all), so parsing can go on with the next line.
@@ -100,8 +110,17 @@ impl<R: BufRead> Source<'_, R> {
 }
 
 struct Parser {
+    /// What is left of the budget for long string values.
     budget_left: usize,
+    /// What is left for keys and short strings once `budget_left` is spent
+    /// (the same size again). When both are spent, strings are kept empty
+    /// and object entries are dropped.
+    extra_left: usize,
+    values_left: usize,
+    /// Set while a value is read only to be dropped.
+    discard: bool,
     truncated_strings: usize,
+    dropped_values: usize,
 }
 
 impl Parser {
@@ -117,9 +136,31 @@ impl Parser {
             b't' => src.expect_literal(b"rue").map(|()| Value::Bool(true)),
             b'f' => src.expect_literal(b"alse").map(|()| Value::Bool(false)),
             b'n' => src.expect_literal(b"ull").map(|()| Value::Null),
-            first @ (b'-' | b'0'..=b'9') => Self::number(src, first),
+            first @ (b'-' | b'0'..=b'9') => self.number(src, first),
             _ => Err(Stop::Invalid),
         }
+    }
+
+    /// Read one value and drop it.
+    fn skip_value<R: BufRead>(
+        &mut self,
+        src: &mut Source<'_, R>,
+        depth: usize,
+    ) -> Result<(), Stop> {
+        let was = std::mem::replace(&mut self.discard, true);
+        let result = self.value(src, depth).map(drop);
+        self.discard = was;
+        self.dropped_values += 1;
+        result
+    }
+
+    /// Whether the next container entry can be kept.
+    fn take_value_slot(&mut self) -> bool {
+        if self.discard || self.values_left == 0 {
+            return false;
+        }
+        self.values_left -= 1;
+        true
     }
 
     fn object<R: BufRead>(&mut self, src: &mut Source<'_, R>, depth: usize) -> Result<Value, Stop> {
@@ -134,13 +175,35 @@ impl Parser {
             if src.next()? != b'"' {
                 return Err(Stop::Invalid);
             }
-            let key = self.string(src, true)?;
+            // Top-level fields (type, timestamp, message) are kept even
+            // when the value limit is spent, up to a few hundred of them.
+            let top_level = depth == 0 && !self.discard && map.len() < 256;
+            let keep = (top_level || self.take_value_slot()) && self.extra_left > 0;
+            let key = if keep {
+                self.string(src, true)?
+            } else {
+                let was = std::mem::replace(&mut self.discard, true);
+                let key = self.string(src, true);
+                self.discard = was;
+                key?
+            };
             src.skip_ws()?;
             if src.next()? != b':' {
                 return Err(Stop::Invalid);
             }
-            let value = self.value(src, depth + 1)?;
-            map.insert(key, value);
+            if keep {
+                let value = self.value(src, depth + 1)?;
+                // A cut key can repeat; never let it replace an earlier value.
+                let mut unique = key.clone();
+                let mut n = 1;
+                while map.contains_key(&unique) {
+                    n += 1;
+                    unique = format!("{key} #{n}");
+                }
+                map.insert(unique, value);
+            } else {
+                self.skip_value(src, depth + 1)?;
+            }
             src.skip_ws()?;
             match src.next()? {
                 b',' => {}
@@ -158,7 +221,11 @@ impl Parser {
             return Ok(Value::Array(items));
         }
         loop {
-            items.push(self.value(src, depth + 1)?);
+            if self.take_value_slot() {
+                items.push(self.value(src, depth + 1)?);
+            } else {
+                self.skip_value(src, depth + 1)?;
+            }
             src.skip_ws()?;
             match src.next()? {
                 b',' => {}
@@ -168,21 +235,36 @@ impl Parser {
         }
     }
 
-    fn number<R: BufRead>(src: &mut Source<'_, R>, first: u8) -> Result<Value, Stop> {
+    fn number<R: BufRead>(&mut self, src: &mut Source<'_, R>, first: u8) -> Result<Value, Stop> {
         let mut text = vec![first];
+        let mut total = 1u64;
         while let Some(byte) = src.peek()? {
             if !matches!(byte, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E') {
                 break;
             }
-            if text.len() >= 128 {
-                return Err(Stop::Invalid);
+            src.next()?;
+            total += 1;
+            if text.len() < MAX_NUMBER_BYTES {
+                text.push(byte);
             }
-            text.push(src.next()?);
         }
-        let text = std::str::from_utf8(&text).map_err(|_| Stop::Invalid)?;
-        serde_json::from_str::<Number>(text)
-            .map(Value::Number)
-            .map_err(|_| Stop::Invalid)
+        if self.discard {
+            return Ok(Value::Null);
+        }
+        let text = String::from_utf8(text).map_err(|_| Stop::Invalid)?;
+        if total as usize <= MAX_NUMBER_BYTES
+            && let Ok(number) = serde_json::from_str::<Number>(&text)
+        {
+            return Ok(Value::Number(number));
+        }
+        // Too long or out of range for a JSON number here: keep its text.
+        let kept = text.len();
+        Ok(Value::String(if total as usize > kept {
+            self.truncated_strings += 1;
+            text + &truncation_marker(kept, total)
+        } else {
+            text
+        }))
     }
 
     fn hex4<R: BufRead>(src: &mut Source<'_, R>) -> Result<u16, Stop> {
@@ -195,12 +277,16 @@ impl Parser {
     }
 
     /// The rest of a string after its opening quote. Bytes past what the
-    /// string may keep are read and dropped. Keys never use the budget.
+    /// string may keep are read and dropped. A long value string uses the
+    /// main budget; keys and short strings may also use the extra allowance.
     fn string<R: BufRead>(&mut self, src: &mut Source<'_, R>, key: bool) -> Result<String, Stop> {
-        let allowed = if key {
-            SMALL_STRING_BYTES
+        let small = SMALL_STRING_BYTES.min(self.extra_left);
+        let allowed = if self.discard {
+            0
+        } else if key {
+            small
         } else {
-            self.budget_left.max(SMALL_STRING_BYTES)
+            self.budget_left.max(small)
         };
         let mut kept: Vec<u8> = Vec::new();
         let mut total: u64 = 0;
@@ -259,9 +345,17 @@ impl Parser {
                 _ => push(&[byte]),
             }
         }
-        if !key {
-            self.budget_left = self.budget_left.saturating_sub(kept.len());
+        if self.discard {
+            return Ok(String::new());
         }
+        // Charge the main budget first (value strings only), then the extra.
+        let from_budget = if key {
+            0
+        } else {
+            kept.len().min(self.budget_left)
+        };
+        self.budget_left -= from_budget;
+        self.extra_left = self.extra_left.saturating_sub(kept.len() - from_budget);
         if !cut {
             return String::from_utf8(kept).map_err(|_| Stop::Invalid);
         }
@@ -273,8 +367,11 @@ impl Parser {
         };
         kept.truncate(valid);
         let mut text = String::from_utf8(kept).map_err(|_| Stop::Invalid)?;
-        let kept_len = text.len();
-        text.push_str(&truncation_marker(kept_len, total));
+        let marker = truncation_marker(text.len(), total);
+        if marker.len() <= self.extra_left {
+            self.extra_left -= marker.len();
+            text.push_str(&marker);
+        }
         Ok(text)
     }
 }
@@ -297,7 +394,11 @@ pub(crate) fn parse_long_line<R: BufRead>(
     };
     let mut parser = Parser {
         budget_left: keep_bytes,
+        extra_left: keep_bytes,
+        values_left: MAX_KEPT_VALUES,
+        discard: false,
         truncated_strings: 0,
+        dropped_values: 0,
     };
     // A byte order mark may start the line, as in the buffered path.
     let parsed = (|| {
@@ -320,6 +421,7 @@ pub(crate) fn parse_long_line<R: BufRead>(
             value,
             consumed: src.consumed,
             truncated_strings: parser.truncated_strings,
+            dropped_values: parser.dropped_values,
         },
         Err(Stop::Eof | Stop::Io) => LongLine::Incomplete,
         Err(Stop::Invalid) => {
@@ -358,7 +460,7 @@ mod tests {
     fn matches_serde_json_when_nothing_is_cut() {
         let lines = [
             r#"{"type":"user","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"plain"}}"#,
-            r#"{"a":[1,-2.5,3e10,true,false,null,{"b":[]},{}],"s":"tab\tquote\"back\\slash\/ é 😀 \u0000"}"#,
+            r#"{"a":[1,-2.5,3e10,true,false,null,{"b":[]},{}],"s":"tab\tquote\"back\\slash\/ \u00e9 \ud83d\ude00 \u0000 é 😀"}"#,
             "  {\"x\" : [ 1 , 2 ] }  ",
             r#"[]"#,
             r#""just a string""#,
@@ -371,7 +473,9 @@ mod tests {
                     value,
                     consumed,
                     truncated_strings,
+                    dropped_values,
                 } => {
+                    assert_eq!(dropped_values, 0);
                     assert_eq!(value, expected, "{line}");
                     assert_eq!(consumed, line.len() as u64 + 1);
                     assert_eq!(truncated_strings, 0);
@@ -405,6 +509,65 @@ mod tests {
         // Short strings after the long one are still kept whole.
         assert_eq!(value["timestamp"], "t");
         assert_eq!(value["type"], "user");
+    }
+
+    #[test]
+    fn many_tiny_values_are_bounded_and_top_level_fields_survive() {
+        let nulls = vec!["null"; MAX_KEPT_VALUES + 10].join(",");
+        let line =
+            format!(r#"{{"type":"user","message":{{"content":[{nulls}]}},"timestamp":"t"}}"#);
+        let LongLine::Parsed {
+            value,
+            dropped_values,
+            ..
+        } = parse(&line, 1 << 20)
+        else {
+            panic!("not parsed");
+        };
+        assert!(dropped_values >= 10, "{dropped_values}");
+        let kept = value["message"]["content"].as_array().unwrap().len();
+        assert!(kept <= MAX_KEPT_VALUES);
+        assert_eq!(value["timestamp"], "t", "a top-level field after the limit");
+    }
+
+    #[test]
+    fn cut_keys_never_replace_each_other() {
+        let a = "k".repeat(SMALL_STRING_BYTES + 10);
+        let line = format!(r#"{{"{a}":1,"{a}":2}}"#);
+        let LongLine::Parsed { value, .. } = parse(&line, 1 << 20) else {
+            panic!("not parsed");
+        };
+        let map = value.as_object().unwrap();
+        assert_eq!(map.len(), 2, "{:?}", map.keys().collect::<Vec<_>>());
+        let values: Vec<_> = map.values().cloned().collect();
+        assert!(values.contains(&Value::from(1)) && values.contains(&Value::from(2)));
+    }
+
+    #[test]
+    fn long_numbers_are_kept_as_text_and_deep_nesting_is_invalid() {
+        let zeros = format!("0.{}", "0".repeat(200));
+        let LongLine::Parsed { value, .. } = parse(&format!(r#"{{"n":{zeros}}}"#), 1 << 20) else {
+            panic!("not parsed");
+        };
+        assert_eq!(value["n"].as_f64(), Some(0.0));
+        let huge = "9".repeat(MAX_NUMBER_BYTES + 5);
+        let LongLine::Parsed { value, .. } = parse(&format!(r#"{{"n":{huge},"t":1}}"#), 1 << 20)
+        else {
+            panic!("not parsed");
+        };
+        assert!(
+            value["n"]
+                .as_str()
+                .unwrap()
+                .contains("[truncated while indexing")
+        );
+        assert_eq!(value["t"], 1);
+        let deep = format!(
+            "{}{}\n",
+            "[".repeat(MAX_DEPTH + 2),
+            "]".repeat(MAX_DEPTH + 2)
+        );
+        assert!(matches!(parse(&deep, 1 << 20), LongLine::Invalid { .. }));
     }
 
     #[test]

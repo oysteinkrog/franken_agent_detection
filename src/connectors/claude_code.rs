@@ -978,6 +978,29 @@ fn blake3_hex_of_range(file: &mut fs::File, from: u64, len: u64) -> Option<Strin
     (copied == len).then(|| hasher.finalize().to_hex().to_string())
 }
 
+/// blake3 hex of 32 blocks of 4 KiB spread evenly over `[0, offset)`, each
+/// hashed with its position.
+fn sampled_blake3(file: &mut fs::File, offset: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const SAMPLES: u64 = 32;
+    const BLOCK: u64 = 4096;
+    let mut hasher = blake3::Hasher::new();
+    let mut block = Vec::with_capacity(BLOCK as usize);
+    for i in 1..=SAMPLES {
+        let pos = offset / (SAMPLES + 1) * i;
+        let len = BLOCK.min(offset - pos);
+        file.seek(SeekFrom::Start(pos)).ok()?;
+        block.clear();
+        (&mut *file).take(len).read_to_end(&mut block).ok()?;
+        if block.len() as u64 != len {
+            return None;
+        }
+        hasher.update(&pos.to_le_bytes());
+        hasher.update(&block);
+    }
+    Some(hasher.finalize().to_hex().to_string())
+}
+
 /// Device and inode of an open file. `None` where the platform has neither,
 /// which disables tail resume there.
 fn open_file_identity(file: &fs::File) -> Option<(u64, u64)> {
@@ -1016,6 +1039,7 @@ fn tail_resume_matches(file: &mut fs::File, resume: &SourceTailResume) -> bool {
     blake3_hex_of_range(file, 0, head_len).as_deref() == Some(resume.head_blake3.as_str())
         && blake3_hex_of_range(file, resume.offset - prefix_len, prefix_len).as_deref()
             == Some(resume.prefix_blake3.as_str())
+        && sampled_blake3(file, resume.offset).as_deref() == Some(resume.samples_blake3.as_str())
 }
 
 /// The last `ai-title` in `[from, from + len)` of the file, else `current`.
@@ -1172,6 +1196,7 @@ fn parse_claude_jsonl_source(
                         value,
                         consumed,
                         truncated_strings,
+                        dropped_values,
                     } => {
                         tracing::warn!(
                             path = %path.display(),
@@ -1179,6 +1204,7 @@ fn parse_claude_jsonl_source(
                             line_bytes = consumed,
                             kept_bytes = keep,
                             truncated_strings,
+                            dropped_values,
                             "claude_code line longer than FAD_CLAUDE_MAX_LINE_BYTES; indexed with its text cut"
                         );
                         offset += consumed;
@@ -1267,19 +1293,23 @@ fn parse_claude_jsonl_source(
         match (
             open_file_identity(&file),
             blake3_hex_of_range(&mut file, 0, head_len),
+            sampled_blake3(&mut file, offset),
             parser.state.to_json(),
         ) {
-            (Some((dev, inode)), Some(head_blake3), Some(carried)) => Some(SourceTailState {
-                offset,
-                next_idx,
-                carried,
-                prefix,
-                resumed,
-                dev,
-                inode,
-                head_len,
-                head_blake3,
-            }),
+            (Some((dev, inode)), Some(head_blake3), Some(samples_blake3), Some(carried)) => {
+                Some(SourceTailState {
+                    offset,
+                    next_idx,
+                    carried,
+                    prefix,
+                    resumed,
+                    dev,
+                    inode,
+                    head_len,
+                    head_blake3,
+                    samples_blake3,
+                })
+            }
             _ => None,
         }
     } else {
@@ -3665,6 +3695,7 @@ mod tests {
             head_len: tail.head_len,
             head_blake3: tail.head_blake3.clone(),
             prefix_blake3: blake3::hash(&tail.prefix).to_hex().to_string(),
+            samples_blake3: tail.samples_blake3.clone(),
         }
     }
 
@@ -3742,6 +3773,30 @@ mod tests {
             .collect();
         assert_eq!(got.len(), 10);
         assert_eq!(got[0].0, 0);
+    }
+
+    #[test]
+    fn a_rewrite_in_the_middle_is_parsed_again_from_the_start() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session = claude_dir.join("session.jsonl");
+        // Long enough that the middle lies outside the 64 KiB head and the
+        // 4 KiB before the offset, short enough that the samples cover it.
+        let pad = "p".repeat(900);
+        let all: Vec<String> = (0..130)
+            .map(|i| session_line(i).replacen("number", &format!("number {pad}"), 1))
+            .collect();
+        write_session(&session, &all[..120]);
+        let first = scan_events(&claude_dir, |_| None);
+        let tail = completion(&first).tail.clone().unwrap();
+        assert!(tail.offset > 100 * 1024, "offset {}", tail.offset);
+
+        let mut rewritten = all.clone();
+        rewritten[85] = rewritten[85].replacen("ppp", "PPP", 1);
+        write_session(&session, &rewritten);
+        let second = scan_events(&claude_dir, |_| Some(resume_from(&tail)));
+        assert!(!completion(&second).tail.clone().unwrap().resumed);
+        assert_eq!(parts(&second)[0].messages[0].idx, 0);
     }
 
     #[test]

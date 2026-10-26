@@ -358,6 +358,8 @@ pub struct SourceTailResume {
     /// blake3 hex of the [`SOURCE_TAIL_PREFIX_BYTES`] (or fewer) bytes
     /// just before `offset`.
     pub prefix_blake3: String,
+    /// blake3 hex of 32 blocks of 4 KiB spread evenly over `[0, offset)`.
+    pub samples_blake3: String,
 }
 
 /// Where a scan of an append-only source stopped.
@@ -387,6 +389,11 @@ pub struct SourceTailState {
     /// hex of the first bytes of that file.
     pub head_len: u64,
     pub head_blake3: String,
+    /// blake3 hex of 32 blocks of 4 KiB spread evenly over `[0, offset)`, so
+    /// an in-place edit in the middle of a file is caught in most cases (in
+    /// every case for files up to about 132 KiB, where the blocks and the
+    /// head cover every byte).
+    pub samples_blake3: String,
 }
 
 /// Bytes before a tail offset that a host should compare before resuming.
