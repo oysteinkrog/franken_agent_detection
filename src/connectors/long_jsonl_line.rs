@@ -24,6 +24,95 @@ const MAX_KEPT_VALUES: usize = 1_000_000;
 /// Longest number token kept as a number; a longer one is kept as text.
 const MAX_NUMBER_BYTES: usize = 4096;
 
+/// Nesting depth, from the line's top value, inside which keys and short
+/// strings may still use the structure pool when both allowances are spent.
+/// It covers `message.content[].text` and the like.
+const POOL_DEPTH: usize = 4;
+
+/// Size of that pool.
+const POOL_BYTES: usize = 1024 * 1024;
+
+/// Whether `token` is a JSON number: -?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?
+fn is_json_number(token: &[u8]) -> bool {
+    let mut i = 0;
+    let digits = |i: &mut usize| {
+        let start = *i;
+        while *i < token.len() && token[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        *i > start
+    };
+    if token.get(i) == Some(&b'-') {
+        i += 1;
+    }
+    match token.get(i) {
+        Some(b'0') => i += 1,
+        Some(b'1'..=b'9') => {
+            digits(&mut i);
+        }
+        _ => return false,
+    }
+    if token.get(i) == Some(&b'.') {
+        i += 1;
+        if !digits(&mut i) {
+            return false;
+        }
+    }
+    if matches!(token.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(token.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        if !digits(&mut i) {
+            return false;
+        }
+    }
+    i == token.len()
+}
+
+/// Streaming check of a number token too long to hold: the same grammar,
+/// one byte at a time.
+#[derive(Clone, Copy, PartialEq)]
+enum NumberState {
+    Sign,
+    Zero,
+    Int,
+    Dot,
+    Frac,
+    Exp,
+    ExpSign,
+    ExpDigits,
+    Bad,
+}
+
+impl NumberState {
+    fn start(first: u8) -> Self {
+        match first {
+            b'-' => Self::Sign,
+            b'0' => Self::Zero,
+            b'1'..=b'9' => Self::Int,
+            _ => Self::Bad,
+        }
+    }
+
+    fn step(self, byte: u8) -> Self {
+        match (self, byte) {
+            (Self::Sign, b'0') => Self::Zero,
+            (Self::Sign, b'1'..=b'9') | (Self::Int, b'0'..=b'9') => Self::Int,
+            (Self::Zero | Self::Int, b'.') => Self::Dot,
+            (Self::Dot | Self::Frac, b'0'..=b'9') => Self::Frac,
+            (Self::Zero | Self::Int | Self::Frac, b'e' | b'E') => Self::Exp,
+            (Self::Exp, b'+' | b'-') => Self::ExpSign,
+            (Self::Exp | Self::ExpSign | Self::ExpDigits, b'0'..=b'9') => Self::ExpDigits,
+            _ => Self::Bad,
+        }
+    }
+
+    fn complete(self) -> bool {
+        matches!(self, Self::Zero | Self::Int | Self::Frac | Self::ExpDigits)
+    }
+}
+
 /// Strings up to this size are always kept whole (keys, types, timestamps),
 /// whatever is left of the budget.
 const SMALL_STRING_BYTES: usize = 4096;
@@ -128,6 +217,10 @@ struct Parser {
     last_string_cut: bool,
     /// Cut keys seen so far; each gets a numbered suffix.
     cut_keys: usize,
+    /// Depth of the string being read, for the structure pool.
+    depth: usize,
+    /// What is left of the structure pool (see `POOL_DEPTH`).
+    pool_left: usize,
 }
 
 impl Parser {
@@ -136,6 +229,7 @@ impl Parser {
             return Err(Stop::Invalid);
         }
         src.skip_ws()?;
+        self.depth = depth;
         let reserve = std::mem::take(&mut self.reserve);
         match src.next()? {
             b'{' => self.object(src, depth),
@@ -191,18 +285,25 @@ impl Parser {
             // Top-level fields (type, timestamp, message) are kept even
             // when the value limit is spent, up to a few hundred of them.
             let top_level = depth == 0 && !self.discard && map.len() < 256;
-            let keep = top_level || (self.take_value_slot() && self.extra_left > 0);
+            let room = self.extra_left > 0 || (depth < POOL_DEPTH && self.pool_left > 0);
+            let keep = top_level || (self.take_value_slot() && room);
             let key = if keep {
+                self.depth = depth + 1;
                 self.reserve = top_level;
                 let key = self.string(src, true);
                 self.reserve = false;
                 let key = key?;
                 if self.last_string_cut {
-                    // A cut key can repeat; give it its own name so it never
-                    // replaces an earlier value. Whole keys keep the usual
-                    // JSON rule: the last value wins.
-                    self.cut_keys += 1;
-                    format!("{key} #{}", self.cut_keys)
+                    // A cut key can repeat; give it its own free name so it
+                    // never replaces an earlier value. Whole keys keep the
+                    // usual JSON rule: the last value wins.
+                    loop {
+                        self.cut_keys += 1;
+                        let name = format!("{key} #{}", self.cut_keys);
+                        if !map.contains_key(&name) {
+                            break name;
+                        }
+                    }
                 } else {
                     key
                 }
@@ -263,40 +364,63 @@ impl Parser {
     ) -> Result<Value, Stop> {
         let mut text = vec![first];
         let mut total = 1u64;
+        let mut state = NumberState::start(first);
         while let Some(byte) = src.peek()? {
             if !matches!(byte, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E') {
                 break;
             }
             src.next()?;
             total += 1;
+            state = state.step(byte);
             if text.len() < MAX_NUMBER_BYTES {
                 text.push(byte);
             }
         }
+        // A malformed number makes the line invalid, as with serde_json,
+        // also inside a value that is being dropped.
+        if !state.complete() {
+            return Err(Stop::Invalid);
+        }
         if self.discard {
             return Ok(Value::Null);
         }
-        let text = String::from_utf8(text).map_err(|_| Stop::Invalid)?;
         if total as usize <= MAX_NUMBER_BYTES {
-            // The same rule as serde_json: a malformed number is invalid.
-            return serde_json::from_str::<Number>(&text)
-                .map(Value::Number)
-                .map_err(|_| Stop::Invalid);
+            debug_assert!(is_json_number(&text));
+            let text = String::from_utf8(text).map_err(|_| Stop::Invalid)?;
+            if let Ok(number) = serde_json::from_str::<Number>(&text) {
+                return Ok(Value::Number(number));
+            }
+            // Valid but out of range here (such as 1e400): keep its text.
+            return Ok(self.number_text(text, total, reserve));
         }
-        // Longer than any real number: keep its first 4 KiB as text, paid
-        // from the extra allowance like a short string.
-        self.truncated_strings += 1;
+        // Longer than any real number: keep its first 4 KiB as text.
+        let text = String::from_utf8(text).map_err(|_| Stop::Invalid)?;
+        Ok(self.number_text(text, total, reserve))
+    }
+
+    /// A number kept as text, paid from the extra allowance like a short
+    /// string; null when that is spent.
+    fn number_text(&mut self, text: String, total: u64, reserve: bool) -> Value {
         let kept = text.len();
-        let marked = text + &truncation_marker(kept, total);
+        let text = if total > kept as u64 {
+            self.truncated_strings += 1;
+            text + &truncation_marker(kept, total)
+        } else {
+            text
+        };
         if reserve {
-            return Ok(Value::String(marked));
+            return Value::String(text);
         }
-        if marked.len() > self.extra_left {
-            self.dropped_values += 1;
-            return Ok(Value::Null);
+        if text.len() <= self.extra_left {
+            self.extra_left -= text.len();
+            return Value::String(text);
         }
-        self.extra_left -= marked.len();
-        Ok(Value::String(marked))
+        if self.depth <= POOL_DEPTH && text.len() <= self.pool_left {
+            self.pool_left -= text.len();
+            return Value::String(text);
+        }
+        self.dropped_values += 1;
+        Value::Null
     }
 
     fn hex4<R: BufRead>(src: &mut Source<'_, R>) -> Result<u16, Stop> {
@@ -314,8 +438,12 @@ impl Parser {
     fn string<R: BufRead>(&mut self, src: &mut Source<'_, R>, key: bool) -> Result<String, Stop> {
         let small = if self.reserve {
             SMALL_STRING_BYTES
-        } else {
+        } else if self.extra_left > 0 {
             SMALL_STRING_BYTES.min(self.extra_left)
+        } else if self.depth <= POOL_DEPTH {
+            SMALL_STRING_BYTES.min(self.pool_left)
+        } else {
+            0
         };
         let allowed = if self.discard {
             0
@@ -392,7 +520,10 @@ impl Parser {
             kept.len().min(self.budget_left)
         };
         self.budget_left -= from_budget;
-        self.extra_left = self.extra_left.saturating_sub(kept.len() - from_budget);
+        let rest = kept.len() - from_budget;
+        let from_extra = rest.min(self.extra_left);
+        self.extra_left -= from_extra;
+        self.pool_left = self.pool_left.saturating_sub(rest - from_extra);
         if !cut {
             return String::from_utf8(kept).map_err(|_| Stop::Invalid);
         }
@@ -439,6 +570,8 @@ pub(crate) fn parse_long_line<R: BufRead>(
         reserve: false,
         last_string_cut: false,
         cut_keys: 0,
+        depth: 0,
+        pool_left: POOL_BYTES,
     };
     // A byte order mark may start the line, as in the buffered path.
     let parsed = (|| {
@@ -601,6 +734,48 @@ mod tests {
         };
         assert_eq!(value["timestamp"], "2026-10-01T10:00:00Z");
         assert_eq!(value["type"], "user");
+    }
+
+    #[test]
+    fn message_content_survives_when_the_allowances_are_spent() {
+        let filler = vec![format!(r#""{}""#, "f".repeat(4000)); 50].join(",");
+        let line = format!(
+            r#"{{"toolUseResult":[{filler}],"message":{{"role":"user","content":[{{"type":"text","text":"hello"}}]}},"timestamp":"t"}}"#
+        );
+        let LongLine::Parsed { value, .. } = parse(&line, 8192) else {
+            panic!("not parsed");
+        };
+        assert_eq!(value["message"]["role"], "user");
+        assert_eq!(value["message"]["content"][0]["text"], "hello");
+        assert_eq!(value["timestamp"], "t");
+    }
+
+    #[test]
+    fn number_grammar_matches_json() {
+        for good in ["0", "-0", "12", "1.5", "1e5", "1E+5", "-1.25e-3", "1e400"] {
+            assert!(is_json_number(good.as_bytes()), "{good}");
+            let mut state = NumberState::start(good.as_bytes()[0]);
+            for &b in &good.as_bytes()[1..] {
+                state = state.step(b);
+            }
+            assert!(state.complete(), "{good}");
+        }
+        for bad in ["-", "01", "1.", ".5", "1e", "1e+", "1-2", "--1", "1.2.3"] {
+            assert!(!is_json_number(bad.as_bytes()), "{bad}");
+            let mut state = NumberState::start(bad.as_bytes()[0]);
+            for &b in &bad.as_bytes()[1..] {
+                state = state.step(b);
+            }
+            assert!(!state.complete(), "{bad}");
+        }
+        let LongLine::Parsed { value, .. } = parse("{\"n\":1e400,\"t\":1}\n", 1 << 20) else {
+            panic!("an out-of-range number keeps the line");
+        };
+        assert_eq!(value["n"], "1e400");
+        // A malformed number in a dropped value still makes the line invalid.
+        let nulls = vec!["null"; MAX_KEPT_VALUES + 2].join(",");
+        let line = format!("{{\"a\":[{nulls},1e+]}}\n");
+        assert!(matches!(parse(&line, 1 << 20), LongLine::Invalid { .. }));
     }
 
     #[test]
