@@ -7,8 +7,8 @@ use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
 use super::scan::{
-    DiscoveredSourceFile, DiscoveredSourceRole, SOURCE_TAIL_PREFIX_BYTES, ScanContext, ScanRoot,
-    SourceCompletion, SourceScanHooks, SourceTailResume, SourceTailState,
+    DiscoveredSourceFile, DiscoveredSourceRole, SOURCE_TAIL_HEAD_BYTES, SOURCE_TAIL_PREFIX_BYTES,
+    ScanContext, ScanRoot, SourceCompletion, SourceScanHooks, SourceTailResume, SourceTailState,
 };
 use super::utils::{
     dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
@@ -541,13 +541,18 @@ impl ClaudeChunkLimits {
         };
         Self {
             max_messages: read("FAD_CLAUDE_CHUNK_MAX_MESSAGES", DEFAULT_CHUNK_MAX_MESSAGES),
-            max_content_bytes: read("FAD_CLAUDE_CHUNK_MAX_BYTES", DEFAULT_CHUNK_MAX_CONTENT_BYTES),
+            max_content_bytes: read(
+                "FAD_CLAUDE_CHUNK_MAX_BYTES",
+                DEFAULT_CHUNK_MAX_CONTENT_BYTES,
+            ),
         }
     }
 }
 
 #[cfg(test)]
 thread_local! {
+    static TEST_MAX_LINE_BYTES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
     static TEST_CHUNK_LIMITS: std::cell::Cell<Option<ClaudeChunkLimits>> =
         const { std::cell::Cell::new(None) };
 }
@@ -617,14 +622,17 @@ impl ClaudeSessionState {
 /// The title a full parse gives a session: Claude's own last `ai-title`, else
 /// the first line of the first user message, else the workspace folder name.
 fn claude_session_title(state: &ClaudeSessionState, json_title: Option<&String>) -> Option<String> {
-    json_title.cloned().or_else(|| state.first_user_title.clone()).or_else(|| {
-        state
-            .workspace
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .map(String::from)
-    })
+    json_title
+        .cloned()
+        .or_else(|| state.first_user_title.clone())
+        .or_else(|| {
+            state
+                .workspace
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(String::from)
+        })
 }
 
 fn first_line_title(content: &str) -> String {
@@ -691,7 +699,11 @@ impl ClaudeJsonlParser {
             if let Some(message) =
                 ClaudeCodeConnector::queued_command_message(&val, self.compact_message_extra)
             {
-                widen_time_bounds(&mut self.state.started_at, &mut self.state.ended_at, message.created_at);
+                widen_time_bounds(
+                    &mut self.state.started_at,
+                    &mut self.state.ended_at,
+                    message.created_at,
+                );
                 self.push(message);
             }
             return;
@@ -702,8 +714,7 @@ impl ClaudeJsonlParser {
             .and_then(|v| v.as_str())
             .or_else(|| val.get("role").and_then(|v| v.as_str()));
         let is_user_assistant = matches!(entry_type, Some("user" | "assistant"))
-            || (entry_type == Some("message")
-                && matches!(role_hint, Some("user" | "assistant")));
+            || (entry_type == Some("message") && matches!(role_hint, Some("user" | "assistant")));
         if !is_user_assistant {
             return;
         }
@@ -758,10 +769,7 @@ impl ClaudeJsonlParser {
                     Value::String("tool_result".to_string()),
                 );
                 if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
-                    tool_extra.insert(
-                        "tool_use_id".to_string(),
-                        Value::String(id.to_string()),
-                    );
+                    tool_extra.insert("tool_use_id".to_string(), Value::String(id.to_string()));
                 }
                 // Failed tool calls are common and downstream
                 // analytics split on them; pass the flag through
@@ -885,11 +893,123 @@ fn parse_claude_jsonl_line(bytes: &[u8]) -> Option<Value> {
     serde_json::from_str::<Value>(line.trim_start_matches('\u{feff}')).ok()
 }
 
+/// Longest JSONL line the parser buffers, `FAD_CLAUDE_MAX_LINE_BYTES` to
+/// override. Real Claude Code lines stay under about 9 MB; a parsed line costs
+/// about nine times its size downstream (200 MiB measured at 1.9 GiB), so the
+/// default keeps one line near 2.3 GiB. A source with a longer line stops
+/// before that line, with a warning, instead of growing without bound.
+const DEFAULT_MAX_LINE_BYTES: usize = 256 * 1024 * 1024;
+
+fn max_line_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = TEST_MAX_LINE_BYTES.with(std::cell::Cell::get) {
+        return cap;
+    }
+    dotenvy::var("FAD_CLAUDE_MAX_LINE_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_LINE_BYTES)
+}
+
+/// Read one line (with its newline) into `line`, buffering at most `cap`
+/// bytes. Returns the bytes consumed and whether the line was longer than
+/// `cap`. A longer line is consumed to its end without being kept when
+/// `skip_long` is set; otherwise reading stops at the cap.
+fn read_line_capped<R: std::io::BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    cap: usize,
+    skip_long: bool,
+) -> std::io::Result<(usize, bool)> {
+    let mut consumed = 0usize;
+    let mut too_long = false;
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok((consumed, too_long));
+        }
+        let (take, done) = match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (buf.len(), false),
+        };
+        if !too_long {
+            if line.len() + take > cap {
+                too_long = true;
+                *line = Vec::new();
+                if !skip_long {
+                    return Ok((consumed, true));
+                }
+            } else {
+                line.extend_from_slice(&buf[..take]);
+            }
+        }
+        reader.consume(take);
+        consumed += take;
+        if done {
+            return Ok((consumed, too_long));
+        }
+    }
+}
+
+fn blake3_hex_of_range(file: &mut fs::File, from: u64, len: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    let copied = std::io::copy(&mut file.take(len), &mut hasher).ok()?;
+    (copied == len).then(|| hasher.finalize().to_hex().to_string())
+}
+
+/// Device and inode of an open file. `None` where the platform has neither,
+/// which disables tail resume there.
+fn open_file_identity(file: &fs::File) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata().ok()?;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        None
+    }
+}
+
+/// Whether `resume` describes the file behind `file`: same device and inode,
+/// at least `offset` bytes, and the same first bytes and bytes before
+/// `offset`. All reads go through the open file, so a file swapped in after
+/// the host checked the path is caught here.
+fn tail_resume_matches(file: &mut fs::File, resume: &SourceTailResume) -> bool {
+    let Some((dev, inode)) = open_file_identity(file) else {
+        return false;
+    };
+    if (dev, inode) != (resume.dev, resume.inode) {
+        return false;
+    }
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    let head_len = resume.offset.min(SOURCE_TAIL_HEAD_BYTES as u64);
+    if metadata.len() < resume.offset || resume.head_len != head_len {
+        return false;
+    }
+    let prefix_len = resume.offset.min(SOURCE_TAIL_PREFIX_BYTES as u64);
+    blake3_hex_of_range(file, 0, head_len).as_deref() == Some(resume.head_blake3.as_str())
+        && blake3_hex_of_range(file, resume.offset - prefix_len, prefix_len).as_deref()
+            == Some(resume.prefix_blake3.as_str())
+}
+
 /// The last `ai-title` in `[from, from + len)` of the file, else `current`.
 /// Run once, only when a session is split into parts, so that every part
 /// carries the title the whole session ends with.
-fn scan_final_ai_title(path: &Path, from: u64, len: u64, current: Option<String>) -> Option<String> {
-    use std::io::{BufRead, Read, Seek, SeekFrom};
+fn scan_final_ai_title(
+    path: &Path,
+    from: u64,
+    len: u64,
+    current: Option<String>,
+) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
     let Ok(mut file) = fs::File::open(path) else {
         return current;
     };
@@ -901,11 +1021,13 @@ fn scan_final_ai_title(path: &Path, from: u64, len: u64, current: Option<String>
     let mut line = Vec::new();
     loop {
         line.clear();
-        match reader.read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => break,
+        // Longer lines are skipped without being buffered.
+        match read_line_capped(&mut reader, &mut line, AI_TITLE_LINE_MAX_BYTES, true) {
+            Ok((0, _)) | Err(_) => break,
+            Ok((_, true)) => continue,
             Ok(_) => {}
         }
-        if line.len() > AI_TITLE_LINE_MAX_BYTES || !line.windows(8).any(|w| w == b"ai-title") {
+        if !line.windows(8).any(|w| w == b"ai-title") {
             continue;
         }
         let Some(val) = parse_claude_jsonl_line(&line) else {
@@ -940,32 +1062,34 @@ fn parse_claude_jsonl_source(
     resume: Option<SourceTailResume>,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<ClaudeJsonlOutcome> {
-    use std::io::{BufRead, Read, Seek, SeekFrom};
+    use std::io::{Read, Seek, SeekFrom};
     let path = identity.path;
     let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
 
     let resume = resume.and_then(|resume| {
         let state = ClaudeSessionState::from_json(&resume.carried)?;
-        let fits = options.size_limit.is_none_or(|limit| resume.offset <= limit);
+        let fits = options
+            .size_limit
+            .is_none_or(|limit| resume.offset <= limit);
         (resume.offset > 0 && resume.next_idx >= 0 && fits).then_some((resume, state))
     });
     let mut prefix = Vec::new();
     let (start, mut next_idx, state) = match resume {
-        Some((resume, state)) => {
-            let from = resume.offset.saturating_sub(SOURCE_TAIL_PREFIX_BYTES as u64);
+        Some((resume, state)) if tail_resume_matches(&mut file, &resume) => {
+            let from = resume
+                .offset
+                .saturating_sub(SOURCE_TAIL_PREFIX_BYTES as u64);
             file.seek(SeekFrom::Start(from))
                 .with_context(|| format!("seek {}", path.display()))?;
             (&mut file)
                 .take(resume.offset - from)
                 .read_to_end(&mut prefix)
                 .with_context(|| format!("read {}", path.display()))?;
-            if prefix.len() as u64 == resume.offset - from {
-                (resume.offset, resume.next_idx, state)
-            } else {
-                // Shorter than the resume point: not an append. Parse it all.
-                prefix.clear();
-                (0, 0, ClaudeSessionState::default())
-            }
+            (resume.offset, resume.next_idx, state)
+        }
+        Some(_) => {
+            tracing::debug!(path = %path.display(), "claude_code tail resume does not match the open file; parsing from the start");
+            (0, 0, ClaudeSessionState::default())
         }
         None => (0, 0, ClaudeSessionState::default()),
     };
@@ -1001,14 +1125,29 @@ fn parse_claude_jsonl_source(
         conversations_emitted += 1;
         messages_emitted += messages.len();
         let json_title = part_title.map_or(parser.state.json_title.as_ref(), Option::as_ref);
-        on_conversation(claude_jsonl_part(identity, &parser.state, json_title, messages))
+        on_conversation(claude_jsonl_part(
+            identity,
+            &parser.state,
+            json_title,
+            messages,
+        ))
     };
 
+    let max_line = max_line_bytes();
     let mut line = Vec::new();
     loop {
         line.clear();
-        let read = match reader.read_until(b'\n', &mut line) {
-            Ok(read) => read,
+        let read = match read_line_capped(&mut reader, &mut line, max_line, false) {
+            Ok((_, true)) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    offset,
+                    max_line_bytes = max_line,
+                    "claude_code line longer than FAD_CLAUDE_MAX_LINE_BYTES; stopping this source before it"
+                );
+                break;
+            }
+            Ok((read, false)) => read,
             Err(error) => {
                 tracing::debug!(path = %path.display(), %error, "claude_code read error; stopping at last complete line");
                 break;
@@ -1055,14 +1194,28 @@ fn parse_claude_jsonl_source(
         emit(&mut parser, part_title.as_ref(), &mut next_idx)?;
     }
 
+    // The reader owns the file; take it back for the head hash.
+    let mut file = reader.into_inner().into_inner();
     let tail = if options.wants_tail {
-        parser.state.to_json().map(|carried| SourceTailState {
-            offset,
-            next_idx,
-            carried,
-            prefix,
-            resumed,
-        })
+        let head_len = offset.min(SOURCE_TAIL_HEAD_BYTES as u64);
+        match (
+            open_file_identity(&file),
+            blake3_hex_of_range(&mut file, 0, head_len),
+            parser.state.to_json(),
+        ) {
+            (Some((dev, inode)), Some(head_blake3), Some(carried)) => Some(SourceTailState {
+                offset,
+                next_idx,
+                carried,
+                prefix,
+                resumed,
+                dev,
+                inode,
+                head_len,
+                head_blake3,
+            }),
+            _ => None,
+        }
     } else {
         None
     };
@@ -3293,7 +3446,9 @@ mod tests {
         let connector = ClaudeCodeConnector::new();
         let ctx = ScanContext::local_default(claude_dir.to_path_buf(), None);
         let mut on_complete = |completion: &SourceCompletion| {
-            events.borrow_mut().push(Event::Complete(completion.clone()));
+            events
+                .borrow_mut()
+                .push(Event::Complete(completion.clone()));
             Ok(())
         };
         let mut hooks = SourceScanHooks {
@@ -3366,7 +3521,11 @@ mod tests {
 
         let events = with_chunk_limits(4, || scan_events(&claude_dir, |_| None));
         let parts = parts(&events);
-        assert!(parts.len() > 3, "the session is split: {} parts", parts.len());
+        assert!(
+            parts.len() > 3,
+            "the session is split: {} parts",
+            parts.len()
+        );
         assert!(
             matches!(events.last(), Some(Event::Complete(_))),
             "the completion comes after the last part"
@@ -3420,7 +3579,12 @@ mod tests {
         let got: Vec<_> = part.messages.iter().map(message_key).collect();
         assert_eq!(got, expected);
         let tail = completion(&events).tail.clone().expect("tail state");
-        assert_eq!(tail.offset, fs::metadata(claude_dir.join("session.jsonl")).unwrap().len());
+        assert_eq!(
+            tail.offset,
+            fs::metadata(claude_dir.join("session.jsonl"))
+                .unwrap()
+                .len()
+        );
         assert_eq!(tail.next_idx, 6);
         assert!(!tail.resumed);
     }
@@ -3430,6 +3594,11 @@ mod tests {
             offset: tail.offset,
             next_idx: tail.next_idx,
             carried: tail.carried.clone(),
+            dev: tail.dev,
+            inode: tail.inode,
+            head_len: tail.head_len,
+            head_blake3: tail.head_blake3.clone(),
+            prefix_blake3: blake3::hash(&tail.prefix).to_hex().to_string(),
         }
     }
 
@@ -3444,7 +3613,10 @@ mod tests {
         let tail = completion(&first).tail.clone().unwrap();
         assert_eq!(tail.next_idx, 7);
         let prefix_len = tail.prefix.len();
-        assert_eq!(&tail.prefix[..], &fs::read(&session).unwrap()[tail.offset as usize - prefix_len..]);
+        assert_eq!(
+            &tail.prefix[..],
+            &fs::read(&session).unwrap()[tail.offset as usize - prefix_len..]
+        );
 
         write_session(&session, &all);
         let second = scan_events(&claude_dir, |_| Some(resume_from(&tail)));
@@ -3456,7 +3628,10 @@ mod tests {
             .unwrap();
         let expected: Vec<_> = full[0].messages[7..].iter().map(message_key).collect();
         assert_eq!(got, expected, "only the 3 appended messages, idx 7..10");
-        assert_eq!(parts[0].title, full[0].title, "title carried from the earlier scan");
+        assert_eq!(
+            parts[0].title, full[0].title,
+            "title carried from the earlier scan"
+        );
         assert_eq!(parts[0].started_at, full[0].started_at);
         assert_eq!(parts[0].ended_at, full[0].ended_at);
         assert_eq!(parts[0].metadata, full[0].metadata);
@@ -3469,8 +3644,110 @@ mod tests {
         let third = scan_events(&claude_dir, |_| Some(resume_from(&tail2)));
         assert!(parts_is_empty(&third));
         let tail3 = completion(&third).tail.clone().unwrap();
-        assert_eq!((tail3.offset, tail3.next_idx), (tail2.offset, tail2.next_idx));
+        assert_eq!(
+            (tail3.offset, tail3.next_idx),
+            (tail2.offset, tail2.next_idx)
+        );
         assert_eq!(tail3.prefix, tail2.prefix);
+    }
+
+    #[test]
+    fn a_rewrite_near_the_start_is_parsed_again_from_the_start() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session = claude_dir.join("session.jsonl");
+        let all: Vec<String> = (0..10).map(session_line).collect();
+        write_session(&session, &all[..7]);
+        let first = scan_events(&claude_dir, |_| None);
+        let tail = completion(&first).tail.clone().unwrap();
+
+        // Same inode, same bytes before the offset, but line 1 changed (same
+        // length) and new lines appended: the head hash no longer matches.
+        let mut rewritten = all.clone();
+        rewritten[1] = rewritten[1].replacen("number", "NUMBER", 1);
+        assert_eq!(rewritten[1].len(), all[1].len());
+        write_session(&session, &rewritten);
+        let second = scan_events(&claude_dir, |_| Some(resume_from(&tail)));
+        let tail2 = completion(&second).tail.clone().unwrap();
+        assert!(!tail2.resumed, "parsed from the start");
+        let got: Vec<_> = parts(&second)
+            .iter()
+            .flat_map(|part| part.messages.iter().map(message_key))
+            .collect();
+        assert_eq!(got.len(), 10);
+        assert_eq!(got[0].0, 0);
+    }
+
+    #[test]
+    fn a_different_file_at_the_same_path_is_parsed_from_the_start() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session = claude_dir.join("session.jsonl");
+        let all: Vec<String> = (0..10).map(session_line).collect();
+        write_session(&session, &all[..7]);
+        let first = scan_events(&claude_dir, |_| None);
+        let tail = completion(&first).tail.clone().unwrap();
+
+        // Same bytes plus an append, but a new file (new inode) renamed into
+        // place, the way an editor or a copy replaces a file.
+        let replacement = claude_dir.join("replacement.tmp");
+        write_session(&replacement, &all);
+        fs::rename(&replacement, &session).unwrap();
+        let second = scan_events(&claude_dir, |_| Some(resume_from(&tail)));
+        let tail2 = completion(&second).tail.clone().unwrap();
+        assert!(!tail2.resumed, "a new inode is never resumed");
+        assert_ne!(tail2.inode, tail.inode);
+        assert_eq!(parts(&second)[0].messages[0].idx, 0);
+    }
+
+    #[test]
+    fn a_line_longer_than_the_cap_stops_the_source_before_it() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session = claude_dir.join("session.jsonl");
+        let mut lines: Vec<String> = (0..3).map(session_line).collect();
+        let long =
+            session_line(3).replacen("number 3", &format!("number 3 {}", "x".repeat(8192)), 1);
+        lines.push(long);
+        lines.push(session_line(4));
+        write_session(&session, &lines);
+
+        TEST_MAX_LINE_BYTES.with(|cap| cap.set(Some(4096)));
+        let events = scan_events(&claude_dir, |_| None);
+        TEST_MAX_LINE_BYTES.with(|cap| cap.set(None));
+        let tail = completion(&events).tail.clone().unwrap();
+        let before_long: usize = lines[..3].iter().map(|l| l.len() + 1).sum();
+        assert_eq!(
+            tail.offset, before_long as u64,
+            "stops before the long line"
+        );
+        assert_eq!(tail.next_idx, 3);
+
+        // With the default cap the same file parses in full.
+        let events = scan_events(&claude_dir, |_| None);
+        assert_eq!(completion(&events).tail.clone().unwrap().next_idx, 5);
+    }
+
+    #[test]
+    fn capped_line_reader_never_buffers_past_the_cap() {
+        let data = format!("short\n{}\nafter\n", "y".repeat(10_000));
+        let mut reader = std::io::BufReader::with_capacity(64, data.as_bytes());
+        let mut line = Vec::new();
+        assert_eq!(
+            read_line_capped(&mut reader, &mut line, 100, true).unwrap(),
+            (6, false)
+        );
+        assert_eq!(line, b"short\n");
+        line.clear();
+        let (read, too_long) = read_line_capped(&mut reader, &mut line, 100, true).unwrap();
+        assert_eq!((read, too_long), (10_001, true));
+        assert!(line.is_empty() && line.capacity() <= 100);
+        line.clear();
+        assert_eq!(
+            read_line_capped(&mut reader, &mut line, 100, true).unwrap(),
+            (6, false)
+        );
+        assert_eq!(line, b"after\n");
     }
 
     fn parts_is_empty(events: &[Event]) -> bool {
@@ -3506,7 +3783,11 @@ mod tests {
         let first = scan_events(&claude_dir, |_| None);
         assert_eq!(parts(&first)[0].messages.len(), 3);
         let tail = completion(&first).tail.clone().unwrap();
-        assert_eq!(tail.offset, complete.len() as u64, "the half line is not consumed");
+        assert_eq!(
+            tail.offset,
+            complete.len() as u64,
+            "the half line is not consumed"
+        );
         assert_eq!(tail.next_idx, 3);
 
         fs::write(&session, format!("{complete}{}\n", lines[3])).unwrap();
@@ -3568,7 +3849,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(got[0].messages.len(), 2, "bytes after the snapshot are not read");
+        assert_eq!(
+            got[0].messages.len(),
+            2,
+            "bytes after the snapshot are not read"
+        );
         let tail = outcome.tail.unwrap();
         assert_eq!(tail.offset, limit);
         assert_eq!(tail.next_idx, 2);
@@ -3612,7 +3897,10 @@ mod tests {
             started_at: Some(1),
             ended_at: Some(2),
         };
-        assert_eq!(ClaudeSessionState::from_json(&state.to_json().unwrap()), Some(state));
+        assert_eq!(
+            ClaudeSessionState::from_json(&state.to_json().unwrap()),
+            Some(state)
+        );
         assert_eq!(
             ClaudeSessionState::from_json(&ClaudeSessionState::default().to_json().unwrap()),
             Some(ClaudeSessionState::default())
@@ -3623,7 +3911,10 @@ mod tests {
     fn hosts_without_tail_hooks_keep_the_old_completion() {
         let dir = TempDir::new().unwrap();
         let claude_dir = make_test_claude_dir(dir.path());
-        write_session(&claude_dir.join("session.jsonl"), &(0..3).map(session_line).collect::<Vec<_>>());
+        write_session(
+            &claude_dir.join("session.jsonl"),
+            &(0..3).map(session_line).collect::<Vec<_>>(),
+        );
         let mut completions = Vec::new();
         let mut on_complete = |completion: &SourceCompletion| {
             completions.push(completion.clone());

@@ -68,8 +68,8 @@ mod conformance_tests;
 
 pub use path_trie::PathTrie;
 pub use scan::{
-    DiscoveredSourceFile, DiscoveredSourceRole, SOURCE_TAIL_PREFIX_BYTES, ScanContext, ScanRoot,
-    SourceCompletion, SourceScanHooks, SourceTailResume, SourceTailState,
+    DiscoveredSourceFile, DiscoveredSourceRole, SOURCE_TAIL_HEAD_BYTES, SOURCE_TAIL_PREFIX_BYTES,
+    ScanContext, ScanRoot, SourceCompletion, SourceScanHooks, SourceTailResume, SourceTailState,
 };
 pub use token_extraction::{
     ExtractedTokenUsage, ModelInfo, TokenDataSource, estimate_tokens_from_content,

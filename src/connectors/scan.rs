@@ -337,8 +337,10 @@ pub struct SourceCompletion {
 }
 
 /// A resume point for an append-only source, handed to the connector by the
-/// host. The host checks that the bytes before `offset` are unchanged
-/// before it returns one; the connector then parses only from `offset`.
+/// host from an earlier [`SourceTailState`]. The connector checks it against
+/// the file it opened (device and inode, the first bytes and the bytes just
+/// before `offset`, all on the same open file) and parses only from `offset`
+/// when every check passes. Any mismatch means a parse from the start.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceTailResume {
     /// Byte offset just after the last line the earlier scan consumed.
@@ -347,6 +349,15 @@ pub struct SourceTailResume {
     pub next_idx: i64,
     /// Connector-owned parse state at `offset`, from [`SourceTailState::carried`].
     pub carried: serde_json::Value,
+    /// Device and inode of the file the earlier scan read.
+    pub dev: u64,
+    pub inode: u64,
+    /// Length and blake3 hex of the first bytes of the file.
+    pub head_len: u64,
+    pub head_blake3: String,
+    /// blake3 hex of the [`SOURCE_TAIL_PREFIX_BYTES`] (or fewer) bytes
+    /// just before `offset`.
+    pub prefix_blake3: String,
 }
 
 /// Where a scan of an append-only source stopped.
@@ -369,10 +380,20 @@ pub struct SourceTailState {
     pub prefix: Vec<u8>,
     /// Whether this scan started from a [`SourceTailResume`].
     pub resumed: bool,
+    /// Device and inode of the open file the scan read.
+    pub dev: u64,
+    pub inode: u64,
+    /// Length (up to [`SOURCE_TAIL_HEAD_BYTES`], at most `offset`) and blake3
+    /// hex of the first bytes of that file.
+    pub head_len: u64,
+    pub head_blake3: String,
 }
 
 /// Bytes before a tail offset that a host should compare before resuming.
 pub const SOURCE_TAIL_PREFIX_BYTES: usize = 4096;
+
+/// Bytes at the start of a source that are compared before resuming.
+pub const SOURCE_TAIL_HEAD_BYTES: usize = 64 * 1024;
 
 /// Host hooks for resumable per-source ingestion (FAD#22).
 ///

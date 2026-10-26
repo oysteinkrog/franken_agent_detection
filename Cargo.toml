@@ -62,6 +62,7 @@ default = []
 # Base connector support: shared deps for built-in non-SQLite connectors
 connectors = [
     "dep:anyhow",
+    "dep:blake3",
     "dep:serde_json",
     "dep:walkdir",
     "dep:tracing",
