@@ -675,6 +675,7 @@ fn scan_gemini_with_hooks(
                     source: discovered,
                     required_sidecars: Vec::new(),
                     conversations_emitted: 1,
+                    tail: None,
                 })?;
             }
         }

@@ -370,6 +370,7 @@ impl ShelleyConnector {
                             source: discovered,
                             required_sidecars: wal_discovered.into_iter().collect(),
                             conversations_emitted: emitted,
+                            tail: None,
                         })?;
                     }
                 }
@@ -2865,6 +2866,7 @@ mod tests {
             let mut hooks = SourceScanHooks {
                 should_scan_source: None,
                 on_source_complete: Some(&mut on_complete),
+                tail_resume: None,
             };
             connector
                 .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
@@ -2920,6 +2922,7 @@ mod tests {
             let mut hooks = SourceScanHooks {
                 should_scan_source: None,
                 on_source_complete: Some(&mut on_complete),
+                tail_resume: None,
             };
             let result = connector.scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
                 emitted += 1;
@@ -2959,6 +2962,7 @@ mod tests {
             let mut hooks = SourceScanHooks {
                 should_scan_source: Some(&mut should_scan),
                 on_source_complete: Some(&mut on_complete),
+                tail_resume: None,
             };
             connector
                 .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
@@ -2994,6 +2998,7 @@ mod tests {
             let mut hooks = SourceScanHooks {
                 should_scan_source: None,
                 on_source_complete: Some(&mut on_complete),
+                tail_resume: None,
             };
             connector
                 .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conv| {
@@ -3016,6 +3021,7 @@ mod tests {
             let mut hooks = SourceScanHooks {
                 should_scan_source: Some(&mut should_scan),
                 on_source_complete: None,
+                tail_resume: None,
             };
             connector
                 .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {

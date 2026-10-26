@@ -326,9 +326,53 @@ pub struct SourceCompletion {
     /// changed when any of these no longer match. Optional sidecars are
     /// excluded.
     pub required_sidecars: Vec<DiscoveredSourceFile>,
-    /// Conversations delivered from this source during this scan.
+    /// Conversations delivered from this source during this scan. A
+    /// connector that emits one session in several parts (see
+    /// [`SourceScanHooks::tail_resume`]) counts each part.
     pub conversations_emitted: usize,
+    /// Where this scan stopped in an append-only source, for a later tail
+    /// scan. Set only by connectors that support tail scans, and only when
+    /// the host installed [`SourceScanHooks::tail_resume`].
+    pub tail: Option<SourceTailState>,
 }
+
+/// A resume point for an append-only source, handed to the connector by the
+/// host. The host checks that the bytes before `offset` are unchanged
+/// before it returns one; the connector then parses only from `offset`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceTailResume {
+    /// Byte offset just after the last line the earlier scan consumed.
+    pub offset: u64,
+    /// Message index the next parsed message gets.
+    pub next_idx: i64,
+    /// Connector-owned parse state at `offset`, from [`SourceTailState::carried`].
+    pub carried: serde_json::Value,
+}
+
+/// Where a scan of an append-only source stopped.
+///
+/// A connector that supports tail scans reads a source only up to the size
+/// it observed before parsing (`DiscoveredSourceFile::size_bytes`), and
+/// consumes only complete lines, so a file that grows during the parse is
+/// still reported at a consistent point.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceTailState {
+    /// Byte offset just after the last consumed line.
+    pub offset: u64,
+    /// Message index the next parsed message gets.
+    pub next_idx: i64,
+    /// Connector-owned parse state at `offset` (versioned JSON).
+    pub carried: serde_json::Value,
+    /// Up to [`SOURCE_TAIL_PREFIX_BYTES`] bytes of the source just before
+    /// `offset`, as the scan read them. Hosts store a hash of these bytes and
+    /// compare it before resuming, to catch a rewritten source.
+    pub prefix: Vec<u8>,
+    /// Whether this scan started from a [`SourceTailResume`].
+    pub resumed: bool,
+}
+
+/// Bytes before a tail offset that a host should compare before resuming.
+pub const SOURCE_TAIL_PREFIX_BYTES: usize = 4096;
 
 /// Host hooks for resumable per-source ingestion (FAD#22).
 ///
@@ -345,6 +389,14 @@ pub struct SourceScanHooks<'a> {
     /// or cancellation. An error return aborts the scan.
     #[allow(clippy::type_complexity)]
     pub on_source_complete: Option<&'a mut dyn FnMut(&SourceCompletion) -> anyhow::Result<()>>,
+    /// Optional tail-scan support. Called after `should_scan_source` allowed
+    /// a source; a `Some` lets a connector that supports tail scans parse
+    /// only the bytes after the resume point. Installing this hook also tells
+    /// such connectors to report [`SourceCompletion::tail`], and to report a
+    /// completion for a source that grew during the parse (they read only up
+    /// to the pre-parse size). Connectors without tail support ignore it.
+    #[allow(clippy::type_complexity)]
+    pub tail_resume: Option<&'a mut dyn FnMut(&DiscoveredSourceFile) -> Option<SourceTailResume>>,
 }
 
 impl SourceScanHooks<'_> {
@@ -353,6 +405,17 @@ impl SourceScanHooks<'_> {
         self.should_scan_source
             .as_mut()
             .is_none_or(|predicate| predicate(source))
+    }
+
+    /// Whether the host takes tail state (see [`Self::tail_resume`]).
+    #[must_use]
+    pub const fn supports_tail(&self) -> bool {
+        self.tail_resume.is_some()
+    }
+
+    /// Ask the host for a resume point (default: none, parse from the start).
+    pub fn resume_point(&mut self, source: &DiscoveredSourceFile) -> Option<SourceTailResume> {
+        self.tail_resume.as_mut().and_then(|resume| resume(source))
     }
 
     /// Deliver a completion event (default: no-op).
@@ -374,6 +437,7 @@ impl std::fmt::Debug for SourceScanHooks<'_> {
                 "on_source_complete",
                 &self.on_source_complete.as_ref().map(|_| "<fn>"),
             )
+            .field("tail_resume", &self.tail_resume.as_ref().map(|_| "<fn>"))
             .finish()
     }
 }

@@ -307,6 +307,7 @@ impl Connector for GrokBotConnector {
                     source,
                     required_sidecars: Vec::new(),
                     conversations_emitted,
+                    tail: None,
                 })?;
             }
         }
@@ -536,6 +537,7 @@ mod tests {
                     &mut SourceScanHooks {
                         should_scan_source: None,
                         on_source_complete: Some(&mut complete),
+                        tail_resume: None,
                     },
                     &mut |c| {
                         conversations.push(c);
@@ -605,6 +607,7 @@ mod tests {
                     &mut SourceScanHooks {
                         should_scan_source: None,
                         on_source_complete: Some(&mut complete),
+                        tail_resume: None,
                     },
                     &mut |_| panic!("malformed input emitted a conversation"),
                 )
@@ -625,6 +628,7 @@ mod tests {
                 &mut SourceScanHooks {
                     should_scan_source: None,
                     on_source_complete: Some(&mut complete),
+                    tail_resume: None,
                 },
                 &mut |_| bail!("host transaction failed"),
             )

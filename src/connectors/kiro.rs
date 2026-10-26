@@ -407,6 +407,7 @@ impl Connector for KiroConnector {
                             source: discovered,
                             required_sidecars: sidecar_discovered.into_iter().collect(),
                             conversations_emitted: 1,
+                            tail: None,
                         })?;
                     }
                 }

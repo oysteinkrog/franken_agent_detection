@@ -7,8 +7,8 @@ use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
 use super::scan::{
-    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
-    SourceScanHooks,
+    DiscoveredSourceFile, DiscoveredSourceRole, SOURCE_TAIL_PREFIX_BYTES, ScanContext, ScanRoot,
+    SourceCompletion, SourceScanHooks, SourceTailResume, SourceTailState,
 };
 use super::utils::{
     dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
@@ -507,6 +507,573 @@ fn widen_time_bounds(
     }
 }
 
+/// Default size of one emitted part of a large Claude session. A session over
+/// either limit is emitted as several conversations with the same identity
+/// and continuous message indexes, so a host can store and free each part
+/// instead of holding the whole session in memory.
+const DEFAULT_CHUNK_MAX_MESSAGES: usize = 8_192;
+const DEFAULT_CHUNK_MAX_CONTENT_BYTES: usize = 16 * 1024 * 1024;
+/// Lines longer than this are never `ai-title` entries, so the title pre-pass
+/// does not parse them.
+const AI_TITLE_LINE_MAX_BYTES: usize = 64 * 1024;
+const CARRIED_STATE_VERSION: u64 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaudeChunkLimits {
+    max_messages: usize,
+    max_content_bytes: usize,
+}
+
+impl ClaudeChunkLimits {
+    /// `FAD_CLAUDE_CHUNK_MAX_MESSAGES` and `FAD_CLAUDE_CHUNK_MAX_BYTES`
+    /// override the defaults (tests and memory tuning).
+    fn from_env() -> Self {
+        #[cfg(test)]
+        if let Some(limits) = TEST_CHUNK_LIMITS.with(std::cell::Cell::get) {
+            return limits;
+        }
+        let read = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(default)
+        };
+        Self {
+            max_messages: read("FAD_CLAUDE_CHUNK_MAX_MESSAGES", DEFAULT_CHUNK_MAX_MESSAGES),
+            max_content_bytes: read("FAD_CLAUDE_CHUNK_MAX_BYTES", DEFAULT_CHUNK_MAX_CONTENT_BYTES),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CHUNK_LIMITS: std::cell::Cell<Option<ClaudeChunkLimits>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Session-level state of a Claude JSONL parse: everything a later line, part
+/// or tail scan needs to describe the session exactly as one full parse would.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ClaudeSessionState {
+    workspace: Option<PathBuf>,
+    session_id: Option<String>,
+    git_branch: Option<String>,
+    json_title: Option<String>,
+    first_user_title: Option<String>,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
+}
+
+impl ClaudeSessionState {
+    /// `None` when the state cannot round-trip through JSON (a non-UTF-8
+    /// workspace path); such a source is then always parsed in full.
+    fn to_json(&self) -> Option<Value> {
+        let workspace = match &self.workspace {
+            Some(path) => Some(path.to_str()?.to_string()),
+            None => None,
+        };
+        Some(serde_json::json!({
+            "v": CARRIED_STATE_VERSION,
+            "workspace": workspace,
+            "session_id": self.session_id,
+            "git_branch": self.git_branch,
+            "json_title": self.json_title,
+            "first_user_title": self.first_user_title,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+        }))
+    }
+
+    fn from_json(value: &Value) -> Option<Self> {
+        if value.get("v")?.as_u64()? != CARRIED_STATE_VERSION {
+            return None;
+        }
+        let text = |key: &str| -> Option<Option<String>> {
+            match value.get(key)? {
+                Value::Null => Some(None),
+                Value::String(text) => Some(Some(text.clone())),
+                _ => None,
+            }
+        };
+        let number = |key: &str| -> Option<Option<i64>> {
+            match value.get(key)? {
+                Value::Null => Some(None),
+                other => Some(Some(other.as_i64()?)),
+            }
+        };
+        Some(Self {
+            workspace: text("workspace")?.map(PathBuf::from),
+            session_id: text("session_id")?,
+            git_branch: text("git_branch")?,
+            json_title: text("json_title")?,
+            first_user_title: text("first_user_title")?,
+            started_at: number("started_at")?,
+            ended_at: number("ended_at")?,
+        })
+    }
+}
+
+/// The title a full parse gives a session: Claude's own last `ai-title`, else
+/// the first line of the first user message, else the workspace folder name.
+fn claude_session_title(state: &ClaudeSessionState, json_title: Option<&String>) -> Option<String> {
+    json_title.cloned().or_else(|| state.first_user_title.clone()).or_else(|| {
+        state
+            .workspace
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(String::from)
+    })
+}
+
+fn first_line_title(content: &str) -> String {
+    content
+        .lines()
+        .next()
+        .unwrap_or(content)
+        .chars()
+        .take(100)
+        .collect::<String>()
+}
+
+/// Accumulates the messages of one part of a Claude JSONL session.
+struct ClaudeJsonlParser {
+    state: ClaudeSessionState,
+    messages: Vec<NormalizedMessage>,
+    content_bytes: usize,
+    compact_message_extra: bool,
+}
+
+impl ClaudeJsonlParser {
+    fn push(&mut self, message: NormalizedMessage) {
+        if self.state.first_user_title.is_none() && message.role == "user" {
+            self.state.first_user_title = Some(first_line_title(&message.content));
+        }
+        self.content_bytes = self.content_bytes.saturating_add(message.content.len());
+        self.messages.push(message);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn ingest_line(&mut self, val: Value) {
+        if self.state.workspace.is_none() {
+            self.state.workspace = val.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
+        }
+        if self.state.session_id.is_none() {
+            self.state.session_id = val
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+        }
+        if self.state.git_branch.is_none() {
+            self.state.git_branch = val
+                .get("gitBranch")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+        }
+
+        let entry_type = val.get("type").and_then(|v| v.as_str());
+        // Claude's own generated title beats first-line
+        // truncation; the entry is otherwise skipped as a
+        // non-conversation sidecar type.
+        if entry_type == Some("ai-title") {
+            if let Some(title) = val
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                self.state.json_title = Some(title.to_string());
+            }
+            return;
+        }
+        if entry_type == Some("attachment") {
+            if let Some(message) =
+                ClaudeCodeConnector::queued_command_message(&val, self.compact_message_extra)
+            {
+                widen_time_bounds(&mut self.state.started_at, &mut self.state.ended_at, message.created_at);
+                self.push(message);
+            }
+            return;
+        }
+        let role_hint = val
+            .get("message")
+            .and_then(|m| m.get("role"))
+            .and_then(|v| v.as_str())
+            .or_else(|| val.get("role").and_then(|v| v.as_str()));
+        let is_user_assistant = matches!(entry_type, Some("user" | "assistant"))
+            || (entry_type == Some("message")
+                && matches!(role_hint, Some("user" | "assistant")));
+        if !is_user_assistant {
+            return;
+        }
+
+        let created = val.get("timestamp").and_then(parse_timestamp);
+
+        self.state.started_at = match (self.state.started_at, created) {
+            (Some(curr), Some(ts)) => Some(curr.min(ts)),
+            (None, Some(ts)) => Some(ts),
+            (other, None) => other,
+        };
+        self.state.ended_at = match (self.state.ended_at, created) {
+            (Some(curr), Some(ts)) => Some(curr.max(ts)),
+            (None, Some(ts)) => Some(ts),
+            (Some(curr), None) => Some(curr),
+            (None, None) => None,
+        };
+
+        let role = role_hint.or(entry_type).unwrap_or("agent");
+        let content_val = val
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .or_else(|| val.get("content"));
+        let content_str = content_val.map(flatten_content).unwrap_or_default();
+
+        // Tool results ride in user entries as
+        // content:[{type:"tool_result", tool_use_id, content}].
+        // flatten_content ignores those blocks, so without this
+        // pass every result entry is dropped wholesale
+        // (~30-40% of real entries per transcript), leaving
+        // invocations with call_ids but no outputs anywhere.
+        if let Some(blocks) = content_val.and_then(Value::as_array) {
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                    continue;
+                }
+                let result_text = match block.get("content") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => continue,
+                };
+                if result_text.trim().is_empty() {
+                    continue;
+                }
+                let mut tool_extra = Map::new();
+                tool_extra.insert(
+                    "source".to_string(),
+                    Value::String("tool_result".to_string()),
+                );
+                if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+                    tool_extra.insert(
+                        "tool_use_id".to_string(),
+                        Value::String(id.to_string()),
+                    );
+                }
+                // Failed tool calls are common and downstream
+                // analytics split on them; pass the flag through
+                // when Claude recorded one.
+                if let Some(is_error) = block.get("is_error").and_then(Value::as_bool) {
+                    tool_extra.insert("is_error".to_string(), Value::from(is_error));
+                }
+                self.push(NormalizedMessage {
+                    idx: 0,
+                    role: "tool".to_string(),
+                    author: None,
+                    created_at: created,
+                    content: result_text,
+                    extra: Value::Object(tool_extra),
+                    invocations: Vec::new(),
+                    snippets: Vec::new(),
+                });
+            }
+        }
+
+        if content_str.trim().is_empty() {
+            return;
+        }
+
+        let author = val
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let invocations =
+            content_val.map_or_else(Vec::new, extract_invocations_from_content_blocks);
+
+        self.push(NormalizedMessage {
+            idx: 0,
+            role: role.to_string(),
+            author,
+            created_at: created,
+            content: content_str,
+            extra: if self.compact_message_extra {
+                ClaudeCodeConnector::compact_message_extra(&val)
+            } else {
+                val
+            },
+            invocations,
+            snippets: Vec::new(),
+        });
+    }
+}
+
+/// Per-file identity shared by every part of one Claude session.
+struct ClaudeJsonlIdentity<'p> {
+    path: &'p Path,
+    external_id: Option<String>,
+    is_subagent_transcript: bool,
+    parent_session_id: Option<String>,
+}
+
+struct ClaudeJsonlOptions {
+    /// Read at most this many bytes of the file (the pre-parse size).
+    size_limit: Option<u64>,
+    compact_message_extra: bool,
+    limits: ClaudeChunkLimits,
+    wants_tail: bool,
+}
+
+struct ClaudeJsonlOutcome {
+    conversations_emitted: usize,
+    messages_emitted: usize,
+    resumed: bool,
+    tail: Option<SourceTailState>,
+}
+
+fn claude_jsonl_part(
+    identity: &ClaudeJsonlIdentity<'_>,
+    state: &ClaudeSessionState,
+    json_title: Option<&String>,
+    messages: Vec<NormalizedMessage>,
+) -> NormalizedConversation {
+    NormalizedConversation {
+        agent_slug: "claude_code".into(),
+        external_id: identity.external_id.clone(),
+        title: claude_session_title(state, json_title),
+        workspace: state.workspace.clone(),
+        source_path: identity.path.to_path_buf(),
+        started_at: state.started_at,
+        ended_at: state.ended_at,
+        metadata: serde_json::json!({
+            "source": "claude_code",
+            "sessionId": state.session_id,
+            "cliSessionId": Option::<String>::None,
+            "gitBranch": state.git_branch,
+            "permissionMode": Option::<String>::None,
+            "bodyAvailable": true,
+            "sidechain": identity.is_subagent_transcript,
+            "parentSessionId": identity.parent_session_id
+        }),
+        messages,
+    }
+}
+
+fn push_tail_prefix(prefix: &mut Vec<u8>, bytes: &[u8]) {
+    if bytes.len() >= SOURCE_TAIL_PREFIX_BYTES {
+        prefix.clear();
+        prefix.extend_from_slice(&bytes[bytes.len() - SOURCE_TAIL_PREFIX_BYTES..]);
+        return;
+    }
+    let keep = SOURCE_TAIL_PREFIX_BYTES - bytes.len();
+    if prefix.len() > keep {
+        prefix.drain(..prefix.len() - keep);
+    }
+    prefix.extend_from_slice(bytes);
+}
+
+/// Parse one JSONL record line the way the full-file reader always has:
+/// skip blank and non-UTF-8 lines, strip a BOM, and require valid JSON.
+fn parse_claude_jsonl_line(bytes: &[u8]) -> Option<Value> {
+    let line = std::str::from_utf8(bytes).ok()?;
+    if line.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Value>(line.trim_start_matches('\u{feff}')).ok()
+}
+
+/// The last `ai-title` in `[from, from + len)` of the file, else `current`.
+/// Run once, only when a session is split into parts, so that every part
+/// carries the title the whole session ends with.
+fn scan_final_ai_title(path: &Path, from: u64, len: u64, current: Option<String>) -> Option<String> {
+    use std::io::{BufRead, Read, Seek, SeekFrom};
+    let Ok(mut file) = fs::File::open(path) else {
+        return current;
+    };
+    if file.seek(SeekFrom::Start(from)).is_err() {
+        return current;
+    }
+    let mut reader = std::io::BufReader::with_capacity(256 * 1024, file.take(len));
+    let mut title = current;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if line.len() > AI_TITLE_LINE_MAX_BYTES || !line.windows(8).any(|w| w == b"ai-title") {
+            continue;
+        }
+        let Some(val) = parse_claude_jsonl_line(&line) else {
+            continue;
+        };
+        if val.get("type").and_then(Value::as_str) != Some("ai-title") {
+            continue;
+        }
+        if let Some(found) = val
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            title = Some(found.to_string());
+        }
+    }
+    title
+}
+
+/// Parse a Claude JSONL session, emitting it in parts of bounded size.
+///
+/// Every part shares the session identity; message indexes continue across
+/// parts (and from `resume.next_idx` on a tail scan), so the parts together
+/// equal one full parse. Only complete lines are consumed: a final segment
+/// without a newline is taken only when it is already valid JSON, so a line
+/// still being written is left for the next scan.
+#[allow(clippy::too_many_lines)]
+fn parse_claude_jsonl_source(
+    identity: &ClaudeJsonlIdentity<'_>,
+    options: ClaudeJsonlOptions,
+    resume: Option<SourceTailResume>,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+) -> Result<ClaudeJsonlOutcome> {
+    use std::io::{BufRead, Read, Seek, SeekFrom};
+    let path = identity.path;
+    let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+
+    let resume = resume.and_then(|resume| {
+        let state = ClaudeSessionState::from_json(&resume.carried)?;
+        let fits = options.size_limit.is_none_or(|limit| resume.offset <= limit);
+        (resume.offset > 0 && resume.next_idx >= 0 && fits).then_some((resume, state))
+    });
+    let mut prefix = Vec::new();
+    let (start, mut next_idx, state) = match resume {
+        Some((resume, state)) => {
+            let from = resume.offset.saturating_sub(SOURCE_TAIL_PREFIX_BYTES as u64);
+            file.seek(SeekFrom::Start(from))
+                .with_context(|| format!("seek {}", path.display()))?;
+            (&mut file)
+                .take(resume.offset - from)
+                .read_to_end(&mut prefix)
+                .with_context(|| format!("read {}", path.display()))?;
+            if prefix.len() as u64 == resume.offset - from {
+                (resume.offset, resume.next_idx, state)
+            } else {
+                // Shorter than the resume point: not an append. Parse it all.
+                prefix.clear();
+                (0, 0, ClaudeSessionState::default())
+            }
+        }
+        None => (0, 0, ClaudeSessionState::default()),
+    };
+    let resumed = start > 0;
+    file.seek(SeekFrom::Start(start))
+        .with_context(|| format!("seek {}", path.display()))?;
+    let readable = options
+        .size_limit
+        .map_or(u64::MAX, |limit| limit.saturating_sub(start));
+    let mut reader = std::io::BufReader::with_capacity(256 * 1024, file.take(readable));
+
+    let mut parser = ClaudeJsonlParser {
+        state,
+        messages: Vec::new(),
+        content_bytes: 0,
+        compact_message_extra: options.compact_message_extra,
+    };
+    let mut offset = start;
+    // Set once the session is split: the title every part carries.
+    let mut part_title: Option<Option<String>> = None;
+    let mut conversations_emitted = 0usize;
+    let mut messages_emitted = 0usize;
+    let mut emit = |parser: &mut ClaudeJsonlParser,
+                    part_title: Option<&Option<String>>,
+                    next_idx: &mut i64|
+     -> Result<()> {
+        let mut messages = std::mem::take(&mut parser.messages);
+        parser.content_bytes = 0;
+        for (i, message) in messages.iter_mut().enumerate() {
+            message.idx = next_idx.saturating_add(i64::try_from(i).unwrap_or(i64::MAX));
+        }
+        *next_idx = next_idx.saturating_add(i64::try_from(messages.len()).unwrap_or(i64::MAX));
+        conversations_emitted += 1;
+        messages_emitted += messages.len();
+        let json_title = part_title.map_or(parser.state.json_title.as_ref(), Option::as_ref);
+        on_conversation(claude_jsonl_part(identity, &parser.state, json_title, messages))
+    };
+
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = match reader.read_until(b'\n', &mut line) {
+            Ok(read) => read,
+            Err(error) => {
+                tracing::debug!(path = %path.display(), %error, "claude_code read error; stopping at last complete line");
+                break;
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        let terminated = line.last() == Some(&b'\n');
+        let record = if terminated {
+            &line[..line.len() - 1]
+        } else {
+            &line[..]
+        };
+        let val = parse_claude_jsonl_line(record);
+        if !terminated && val.is_none() {
+            // A line still being written: leave it for the next scan.
+            break;
+        }
+        offset += read as u64;
+        if options.wants_tail {
+            push_tail_prefix(&mut prefix, &line);
+        }
+        let Some(val) = val else {
+            continue;
+        };
+        parser.ingest_line(val);
+        if parser.messages.len() >= options.limits.max_messages
+            || parser.content_bytes >= options.limits.max_content_bytes
+        {
+            if part_title.is_none() {
+                let remaining = start.saturating_add(readable).saturating_sub(offset);
+                part_title = Some(scan_final_ai_title(
+                    path,
+                    offset,
+                    remaining,
+                    parser.state.json_title.clone(),
+                ));
+            }
+            emit(&mut parser, part_title.as_ref(), &mut next_idx)?;
+        }
+    }
+    if !parser.messages.is_empty() {
+        emit(&mut parser, part_title.as_ref(), &mut next_idx)?;
+    }
+
+    let tail = if options.wants_tail {
+        parser.state.to_json().map(|carried| SourceTailState {
+            offset,
+            next_idx,
+            carried,
+            prefix,
+            resumed,
+        })
+    } else {
+        None
+    };
+    Ok(ClaudeJsonlOutcome {
+        conversations_emitted,
+        messages_emitted,
+        resumed,
+        tail,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn scan_claude_with_callback(
     ctx: &ScanContext,
@@ -609,8 +1176,10 @@ fn scan_claude_with_callback_with_exclusions(
             let mut workspace: Option<PathBuf> = None;
             let mut session_id: Option<String> = None;
             let mut cli_session_id: Option<String> = None;
-            let mut git_branch: Option<String> = None;
-            let mut json_title: Option<String> = None;
+            // Only the single-file JSON sidecar path below uses these; the
+            // JSONL path keeps its state in `ClaudeSessionState`.
+            let git_branch: Option<String> = None;
+            let json_title: Option<String>;
             let mut permission_mode: Option<String> = None;
             let mut source_kind = "claude_code";
 
@@ -634,179 +1203,85 @@ fn scan_claude_with_callback_with_exclusions(
             }
 
             if ext == Some("jsonl") {
-                let file = std::fs::File::open(&path)
-                    .with_context(|| format!("open {}", path.display()))?;
-                let reader = std::io::BufReader::new(file);
-
-                for line_res in std::io::BufRead::lines(reader) {
-                    let Ok(line) = line_res else {
-                        continue;
-                    };
-                    if line.trim().is_empty() {
-                        continue;
+                let identity = ClaudeJsonlIdentity {
+                    path: &path,
+                    external_id: external_id_root
+                        .as_deref()
+                        .and_then(|base| path.strip_prefix(base).ok())
+                        .and_then(|rel| rel.to_str())
+                        .map(std::string::ToString::to_string)
+                        .or_else(|| {
+                            path.file_name()
+                                .and_then(|s| s.to_str())
+                                .map(std::string::ToString::to_string)
+                        }),
+                    is_subagent_transcript,
+                    parent_session_id: parent_session_id.clone(),
+                };
+                let wants_tail = hooks.supports_tail();
+                let resume = if wants_tail {
+                    hooks.resume_point(&discovered)
+                } else {
+                    None
+                };
+                // A tail-aware host gets a consistent snapshot: only the bytes
+                // that existed before the parse began. Other hosts keep the
+                // read-to-EOF behaviour and the changed-during-parse check.
+                let size_limit = if wants_tail {
+                    discovered.size_bytes
+                } else {
+                    None
+                };
+                let outcome = parse_claude_jsonl_source(
+                    &identity,
+                    ClaudeJsonlOptions {
+                        size_limit,
+                        compact_message_extra,
+                        limits: ClaudeChunkLimits::from_env(),
+                        wants_tail,
+                    },
+                    resume,
+                    on_conversation,
+                )?;
+                if outcome.conversations_emitted == 0 && !outcome.resumed {
+                    if file_count <= 3 {
+                        tracing::debug!(path = %path.display(), "claude_code no messages extracted");
                     }
-                    // Strip a UTF-8 BOM so the first record (often
-                    // session_meta or the first prompt) is not silently lost.
-                    let line = line.trim_start_matches('\u{feff}');
-                    let Ok(val) = serde_json::from_str::<Value>(line) else {
-                        continue;
-                    };
-
-                    if workspace.is_none() {
-                        workspace = val.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
-                    }
-                    if session_id.is_none() {
-                        session_id = val
-                            .get("sessionId")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-                    }
-                    if git_branch.is_none() {
-                        git_branch = val
-                            .get("gitBranch")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-                    }
-
-                    let entry_type = val.get("type").and_then(|v| v.as_str());
-                    // Claude's own generated title beats first-line
-                    // truncation; the entry is otherwise skipped as a
-                    // non-conversation sidecar type.
-                    if entry_type == Some("ai-title") {
-                        if let Some(title) = val
-                            .get("title")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|t| !t.is_empty())
-                        {
-                            json_title = Some(title.to_string());
-                        }
-                        continue;
-                    }
-                    if entry_type == Some("attachment") {
-                        if let Some(message) =
-                            ClaudeCodeConnector::queued_command_message(&val, compact_message_extra)
-                        {
-                            widen_time_bounds(&mut started_at, &mut ended_at, message.created_at);
-                            messages.push(message);
-                        }
-                        continue;
-                    }
-                    let role_hint = val
-                        .get("message")
-                        .and_then(|m| m.get("role"))
-                        .and_then(|v| v.as_str())
-                        .or_else(|| val.get("role").and_then(|v| v.as_str()));
-                    let is_user_assistant = matches!(entry_type, Some("user" | "assistant"))
-                        || (entry_type == Some("message")
-                            && matches!(role_hint, Some("user" | "assistant")));
-                    if !is_user_assistant {
-                        continue;
-                    }
-
-                    let created = val.get("timestamp").and_then(parse_timestamp);
-
-                    started_at = match (started_at, created) {
-                        (Some(curr), Some(ts)) => Some(curr.min(ts)),
-                        (None, Some(ts)) => Some(ts),
-                        (other, None) => other,
-                    };
-                    ended_at = match (ended_at, created) {
-                        (Some(curr), Some(ts)) => Some(curr.max(ts)),
-                        (None, Some(ts)) => Some(ts),
-                        (Some(curr), None) => Some(curr),
-                        (None, None) => None,
-                    };
-
-                    let role = role_hint.or(entry_type).unwrap_or("agent");
-                    let content_val = val
-                        .get("message")
-                        .and_then(|m| m.get("content"))
-                        .or_else(|| val.get("content"));
-                    let content_str = content_val.map(flatten_content).unwrap_or_default();
-
-                    // Tool results ride in user entries as
-                    // content:[{type:"tool_result", tool_use_id, content}].
-                    // flatten_content ignores those blocks, so without this
-                    // pass every result entry is dropped wholesale
-                    // (~30-40% of real entries per transcript), leaving
-                    // invocations with call_ids but no outputs anywhere.
-                    if let Some(blocks) = content_val.and_then(Value::as_array) {
-                        for block in blocks {
-                            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
-                                continue;
-                            }
-                            let result_text = match block.get("content") {
-                                Some(Value::String(s)) => s.clone(),
-                                Some(Value::Array(parts)) => parts
-                                    .iter()
-                                    .filter_map(|part| part.get("text").and_then(Value::as_str))
-                                    .collect::<Vec<_>>()
-                                    .join("\n"),
-                                _ => continue,
-                            };
-                            if result_text.trim().is_empty() {
-                                continue;
-                            }
-                            let mut tool_extra = Map::new();
-                            tool_extra.insert(
-                                "source".to_string(),
-                                Value::String("tool_result".to_string()),
-                            );
-                            if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
-                                tool_extra.insert(
-                                    "tool_use_id".to_string(),
-                                    Value::String(id.to_string()),
-                                );
-                            }
-                            // Failed tool calls are common and downstream
-                            // analytics split on them; pass the flag through
-                            // when Claude recorded one.
-                            if let Some(is_error) = block.get("is_error").and_then(Value::as_bool) {
-                                tool_extra.insert("is_error".to_string(), Value::from(is_error));
-                            }
-                            messages.push(NormalizedMessage {
-                                idx: 0,
-                                role: "tool".to_string(),
-                                author: None,
-                                created_at: created,
-                                content: result_text,
-                                extra: Value::Object(tool_extra),
-                                invocations: Vec::new(),
-                                snippets: Vec::new(),
-                            });
-                        }
-                    }
-
-                    if content_str.trim().is_empty() {
-                        continue;
-                    }
-
-                    let author = val
-                        .get("message")
-                        .and_then(|m| m.get("model"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    let invocations =
-                        content_val.map_or_else(Vec::new, extract_invocations_from_content_blocks);
-
-                    messages.push(NormalizedMessage {
-                        idx: 0,
-                        role: role.to_string(),
-                        author,
-                        created_at: created,
-                        content: content_str,
-                        extra: if compact_message_extra {
-                            ClaudeCodeConnector::compact_message_extra(&val)
-                        } else {
-                            val
-                        },
-                        invocations,
-                        snippets: Vec::new(),
-                    });
+                    continue;
                 }
-                crate::types::reindex_messages(&mut messages);
-            } else {
+                tracing::debug!(
+                    path = %path.display(),
+                    parts = outcome.conversations_emitted,
+                    messages = outcome.messages_emitted,
+                    resumed = outcome.resumed,
+                    "claude_code extracted messages"
+                );
+                if wants_tail {
+                    // Only bytes up to the pre-parse size were read, so the
+                    // completion stays valid even if the file grew meanwhile;
+                    // the tail state says where the next scan resumes.
+                    hooks.complete(&SourceCompletion {
+                        source: discovered,
+                        required_sidecars: Vec::new(),
+                        conversations_emitted: outcome.conversations_emitted,
+                        tail: outcome.tail,
+                    })?;
+                } else if discovered.fs_metadata_changed() {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "claude_code source changed during parse; completion withheld"
+                    );
+                } else {
+                    hooks.complete(&SourceCompletion {
+                        source: discovered,
+                        required_sidecars: Vec::new(),
+                        conversations_emitted: outcome.conversations_emitted,
+                        tail: None,
+                    })?;
+                }
+                continue;
+            }
+            {
                 if let Ok(metadata) = fs::metadata(&path)
                     && metadata.len() > 100 * 1024 * 1024
                 {
@@ -987,6 +1462,7 @@ fn scan_claude_with_callback_with_exclusions(
                     source: discovered,
                     required_sidecars: Vec::new(),
                     conversations_emitted: 1,
+                    tail: None,
                 })?;
             }
         }
@@ -1376,6 +1852,7 @@ mod tests {
             let mut hooks = SourceScanHooks {
                 should_scan_source: None,
                 on_source_complete: Some(&mut on_complete),
+                tail_resume: None,
             };
             connector
                 .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
@@ -1418,6 +1895,7 @@ mod tests {
             let mut hooks = SourceScanHooks {
                 should_scan_source: Some(&mut should_scan),
                 on_source_complete: None,
+                tail_resume: None,
             };
             connector
                 .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
@@ -2767,5 +3245,403 @@ mod tests {
             convs[0].messages.iter().any(|m| m.content == "Second line"),
             "second line should be extractable regardless of BOM"
         );
+    }
+
+    // =========================================================================
+    // Chunked emission and tail scans
+    // =========================================================================
+
+    fn session_line(i: usize) -> String {
+        let role = if i % 2 == 0 { "user" } else { "assistant" };
+        format!(
+            r#"{{"type":"{role}","cwd":"/work/proj","sessionId":"s-1","gitBranch":"main","timestamp":"2025-12-01T10:{:02}:{:02}Z","message":{{"role":"{role}","content":"message number {i}"}}}}"#,
+            (i / 60) % 60,
+            i % 60
+        )
+    }
+
+    fn write_session(path: &Path, lines: &[String]) {
+        let mut text = lines.join("\n");
+        text.push('\n');
+        fs::write(path, text).unwrap();
+    }
+
+    fn with_chunk_limits<T>(max_messages: usize, f: impl FnOnce() -> T) -> T {
+        TEST_CHUNK_LIMITS.with(|limits| {
+            limits.set(Some(ClaudeChunkLimits {
+                max_messages,
+                max_content_bytes: usize::MAX,
+            }));
+        });
+        let out = f();
+        TEST_CHUNK_LIMITS.with(|limits| limits.set(None));
+        out
+    }
+
+    #[derive(Debug)]
+    enum Event {
+        Part(NormalizedConversation),
+        Complete(SourceCompletion),
+    }
+
+    /// Scan `claude_dir` with tail-aware hooks; `resume` answers tail_resume.
+    fn scan_events(
+        claude_dir: &Path,
+        mut resume: impl FnMut(&DiscoveredSourceFile) -> Option<SourceTailResume>,
+    ) -> Vec<Event> {
+        let events = std::cell::RefCell::new(Vec::new());
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir.to_path_buf(), None);
+        let mut on_complete = |completion: &SourceCompletion| {
+            events.borrow_mut().push(Event::Complete(completion.clone()));
+            Ok(())
+        };
+        let mut hooks = SourceScanHooks {
+            should_scan_source: None,
+            on_source_complete: Some(&mut on_complete),
+            tail_resume: Some(&mut resume),
+        };
+        connector
+            .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
+                events.borrow_mut().push(Event::Part(conversation));
+                Ok(())
+            })
+            .unwrap();
+        events.into_inner()
+    }
+
+    fn parts(events: &[Event]) -> Vec<&NormalizedConversation> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Part(conversation) => Some(conversation),
+                Event::Complete(_) => None,
+            })
+            .collect()
+    }
+
+    fn completion(events: &[Event]) -> &SourceCompletion {
+        let completions: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Complete(completion) => Some(completion),
+                Event::Part(_) => None,
+            })
+            .collect();
+        assert_eq!(completions.len(), 1, "exactly one completion per source");
+        completions[0]
+    }
+
+    fn message_key(message: &NormalizedMessage) -> (i64, String, String, Option<i64>, Value) {
+        (
+            message.idx,
+            message.role.clone(),
+            message.content.clone(),
+            message.created_at,
+            message.extra.clone(),
+        )
+    }
+
+    #[test]
+    fn chunked_parts_concatenate_to_the_one_shot_parse() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let mut lines: Vec<String> = (0..23).map(session_line).collect();
+        // A tool result rides on a user line, and noise lines carry no messages.
+        lines.insert(
+            5,
+            r#"{"type":"user","timestamp":"2025-12-01T10:00:04Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"tool output"},{"type":"text","text":"after tool"}]}}"#
+                .to_string(),
+        );
+        lines.insert(9, r#"{"type":"progress","data":{}}"#.to_string());
+        lines.insert(12, "not json".to_string());
+        lines.push(r#"{"type":"ai-title","title":"Late title"}"#.to_string());
+        write_session(&claude_dir.join("session.jsonl"), &lines);
+
+        let one_shot = ClaudeCodeConnector::new()
+            .scan(&ScanContext::local_default(claude_dir.clone(), None))
+            .unwrap();
+        assert_eq!(one_shot.len(), 1);
+        let one_shot = &one_shot[0];
+
+        let events = with_chunk_limits(4, || scan_events(&claude_dir, |_| None));
+        let parts = parts(&events);
+        assert!(parts.len() > 3, "the session is split: {} parts", parts.len());
+        assert!(
+            matches!(events.last(), Some(Event::Complete(_))),
+            "the completion comes after the last part"
+        );
+        assert_eq!(completion(&events).conversations_emitted, parts.len());
+
+        let joined: Vec<_> = parts
+            .iter()
+            .flat_map(|part| part.messages.iter().map(message_key))
+            .collect();
+        let expected: Vec<_> = one_shot.messages.iter().map(message_key).collect();
+        assert_eq!(joined, expected, "same messages, same order, same idx");
+        for (i, key) in joined.iter().enumerate() {
+            assert_eq!(key.0, i as i64, "idx is continuous across parts");
+        }
+        for part in &parts {
+            assert!(part.messages.len() <= 4);
+            assert_eq!(part.external_id, one_shot.external_id);
+            assert_eq!(part.source_path, one_shot.source_path);
+            assert_eq!(part.workspace, one_shot.workspace);
+            assert_eq!(part.metadata, one_shot.metadata);
+            assert_eq!(
+                part.title.as_deref(),
+                Some("Late title"),
+                "every part carries the title the session ends with"
+            );
+        }
+        let last = parts.last().unwrap();
+        assert_eq!(last.title, one_shot.title);
+        assert_eq!(last.started_at, one_shot.started_at);
+        assert_eq!(last.ended_at, one_shot.ended_at);
+    }
+
+    #[test]
+    fn unchunked_tail_aware_scan_matches_the_plain_scan() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let lines: Vec<String> = (0..6).map(session_line).collect();
+        write_session(&claude_dir.join("session.jsonl"), &lines);
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+        let one_shot = ClaudeCodeConnector::new().scan(&ctx).unwrap();
+        let events = scan_events(&claude_dir, |_| None);
+        let parts = parts(&events);
+        assert_eq!(parts.len(), 1);
+        let part = parts[0];
+        assert_eq!(part.title, one_shot[0].title);
+        assert_eq!(part.metadata, one_shot[0].metadata);
+        assert_eq!(part.started_at, one_shot[0].started_at);
+        assert_eq!(part.ended_at, one_shot[0].ended_at);
+        let expected: Vec<_> = one_shot[0].messages.iter().map(message_key).collect();
+        let got: Vec<_> = part.messages.iter().map(message_key).collect();
+        assert_eq!(got, expected);
+        let tail = completion(&events).tail.clone().expect("tail state");
+        assert_eq!(tail.offset, fs::metadata(claude_dir.join("session.jsonl")).unwrap().len());
+        assert_eq!(tail.next_idx, 6);
+        assert!(!tail.resumed);
+    }
+
+    fn resume_from(tail: &SourceTailState) -> SourceTailResume {
+        SourceTailResume {
+            offset: tail.offset,
+            next_idx: tail.next_idx,
+            carried: tail.carried.clone(),
+        }
+    }
+
+    #[test]
+    fn tail_scan_parses_only_appended_lines_and_continues_idx() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session = claude_dir.join("session.jsonl");
+        let all: Vec<String> = (0..10).map(session_line).collect();
+        write_session(&session, &all[..7]);
+        let first = scan_events(&claude_dir, |_| None);
+        let tail = completion(&first).tail.clone().unwrap();
+        assert_eq!(tail.next_idx, 7);
+        let prefix_len = tail.prefix.len();
+        assert_eq!(&tail.prefix[..], &fs::read(&session).unwrap()[tail.offset as usize - prefix_len..]);
+
+        write_session(&session, &all);
+        let second = scan_events(&claude_dir, |_| Some(resume_from(&tail)));
+        let parts = parts(&second);
+        assert_eq!(parts.len(), 1);
+        let got: Vec<_> = parts[0].messages.iter().map(message_key).collect();
+        let full = ClaudeCodeConnector::new()
+            .scan(&ScanContext::local_default(claude_dir.clone(), None))
+            .unwrap();
+        let expected: Vec<_> = full[0].messages[7..].iter().map(message_key).collect();
+        assert_eq!(got, expected, "only the 3 appended messages, idx 7..10");
+        assert_eq!(parts[0].title, full[0].title, "title carried from the earlier scan");
+        assert_eq!(parts[0].started_at, full[0].started_at);
+        assert_eq!(parts[0].ended_at, full[0].ended_at);
+        assert_eq!(parts[0].metadata, full[0].metadata);
+        let tail2 = completion(&second).tail.clone().unwrap();
+        assert!(tail2.resumed);
+        assert_eq!(tail2.next_idx, 10);
+        assert_eq!(tail2.offset, fs::metadata(&session).unwrap().len());
+
+        // Nothing new: no part, but a completion that keeps the same point.
+        let third = scan_events(&claude_dir, |_| Some(resume_from(&tail2)));
+        assert!(parts_is_empty(&third));
+        let tail3 = completion(&third).tail.clone().unwrap();
+        assert_eq!((tail3.offset, tail3.next_idx), (tail2.offset, tail2.next_idx));
+        assert_eq!(tail3.prefix, tail2.prefix);
+    }
+
+    fn parts_is_empty(events: &[Event]) -> bool {
+        parts(events).is_empty()
+    }
+
+    #[test]
+    fn tail_scan_picks_up_a_late_ai_title() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session = claude_dir.join("session.jsonl");
+        let mut lines: Vec<String> = (0..4).map(session_line).collect();
+        write_session(&session, &lines);
+        let first = scan_events(&claude_dir, |_| None);
+        assert_eq!(parts(&first)[0].title.as_deref(), Some("message number 0"));
+        let tail = completion(&first).tail.clone().unwrap();
+        lines.push(r#"{"type":"ai-title","title":"Named later"}"#.to_string());
+        lines.push(session_line(4));
+        write_session(&session, &lines);
+        let second = scan_events(&claude_dir, |_| Some(resume_from(&tail)));
+        assert_eq!(parts(&second)[0].title.as_deref(), Some("Named later"));
+    }
+
+    #[test]
+    fn a_line_still_being_written_is_left_for_the_next_scan() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session = claude_dir.join("session.jsonl");
+        let lines: Vec<String> = (0..4).map(session_line).collect();
+        let complete = format!("{}\n", lines[..3].join("\n"));
+        let half = &lines[3][..lines[3].len() / 2];
+        fs::write(&session, format!("{complete}{half}")).unwrap();
+        let first = scan_events(&claude_dir, |_| None);
+        assert_eq!(parts(&first)[0].messages.len(), 3);
+        let tail = completion(&first).tail.clone().unwrap();
+        assert_eq!(tail.offset, complete.len() as u64, "the half line is not consumed");
+        assert_eq!(tail.next_idx, 3);
+
+        fs::write(&session, format!("{complete}{}\n", lines[3])).unwrap();
+        let second = scan_events(&claude_dir, |_| Some(resume_from(&tail)));
+        let parts = parts(&second);
+        assert_eq!(parts[0].messages.len(), 1);
+        assert_eq!(parts[0].messages[0].idx, 3);
+        assert_eq!(parts[0].messages[0].content, "message number 3");
+    }
+
+    #[test]
+    fn an_unterminated_but_complete_last_line_is_consumed() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session = claude_dir.join("session.jsonl");
+        let lines: Vec<String> = (0..3).map(session_line).collect();
+        fs::write(&session, lines.join("\n")).unwrap();
+        let plain = ClaudeCodeConnector::new()
+            .scan(&ScanContext::local_default(claude_dir.clone(), None))
+            .unwrap();
+        let events = scan_events(&claude_dir, |_| None);
+        assert_eq!(parts(&events)[0].messages.len(), plain[0].messages.len());
+        assert_eq!(
+            completion(&events).tail.as_ref().unwrap().offset,
+            fs::metadata(&session).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn a_scan_reads_only_up_to_the_pre_parse_size() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session = claude_dir.join("session.jsonl");
+        let lines: Vec<String> = (0..6).map(session_line).collect();
+        write_session(&session, &lines);
+        let identity = ClaudeJsonlIdentity {
+            path: &session,
+            external_id: Some("session.jsonl".into()),
+            is_subagent_transcript: false,
+            parent_session_id: None,
+        };
+        let limit = (lines[0].len() + lines[1].len() + 2) as u64;
+        let mut got = Vec::new();
+        let outcome = parse_claude_jsonl_source(
+            &identity,
+            ClaudeJsonlOptions {
+                size_limit: Some(limit),
+                compact_message_extra: false,
+                limits: ClaudeChunkLimits {
+                    max_messages: 100,
+                    max_content_bytes: usize::MAX,
+                },
+                wants_tail: true,
+            },
+            None,
+            &mut |conversation| {
+                got.push(conversation);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(got[0].messages.len(), 2, "bytes after the snapshot are not read");
+        let tail = outcome.tail.unwrap();
+        assert_eq!(tail.offset, limit);
+        assert_eq!(tail.next_idx, 2);
+    }
+
+    #[test]
+    fn a_resume_point_past_the_end_falls_back_to_a_full_parse() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session = claude_dir.join("session.jsonl");
+        let lines: Vec<String> = (0..4).map(session_line).collect();
+        write_session(&session, &lines);
+        let first = scan_events(&claude_dir, |_| None);
+        let mut resume = resume_from(completion(&first).tail.as_ref().unwrap());
+        resume.offset += 10_000;
+        let events = scan_events(&claude_dir, |_| Some(resume.clone()));
+        let parts = parts(&events);
+        assert_eq!(parts[0].messages.len(), 4);
+        assert_eq!(parts[0].messages[0].idx, 0);
+        assert!(!completion(&events).tail.as_ref().unwrap().resumed);
+
+        // Unknown carried-state version: also a full parse.
+        let mut resume = resume_from(completion(&first).tail.as_ref().unwrap());
+        resume.carried["v"] = serde_json::json!(99);
+        let events = scan_events(&claude_dir, |_| Some(resume.clone()));
+        assert_eq!(parts_count_messages(&events), 4);
+    }
+
+    fn parts_count_messages(events: &[Event]) -> usize {
+        parts(events).iter().map(|part| part.messages.len()).sum()
+    }
+
+    #[test]
+    fn carried_state_round_trips() {
+        let state = ClaudeSessionState {
+            workspace: Some(PathBuf::from("/work/proj")),
+            session_id: Some("s".into()),
+            git_branch: None,
+            json_title: Some("t".into()),
+            first_user_title: Some("u".into()),
+            started_at: Some(1),
+            ended_at: Some(2),
+        };
+        assert_eq!(ClaudeSessionState::from_json(&state.to_json().unwrap()), Some(state));
+        assert_eq!(
+            ClaudeSessionState::from_json(&ClaudeSessionState::default().to_json().unwrap()),
+            Some(ClaudeSessionState::default())
+        );
+    }
+
+    #[test]
+    fn hosts_without_tail_hooks_keep_the_old_completion() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        write_session(&claude_dir.join("session.jsonl"), &(0..3).map(session_line).collect::<Vec<_>>());
+        let mut completions = Vec::new();
+        let mut on_complete = |completion: &SourceCompletion| {
+            completions.push(completion.clone());
+            Ok(())
+        };
+        let mut hooks = SourceScanHooks {
+            should_scan_source: None,
+            on_source_complete: Some(&mut on_complete),
+            tail_resume: None,
+        };
+        ClaudeCodeConnector::new()
+            .scan_with_source_boundaries(
+                &ScanContext::local_default(claude_dir.clone(), None),
+                &mut hooks,
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(completions.len(), 1);
+        assert!(completions[0].tail.is_none());
     }
 }

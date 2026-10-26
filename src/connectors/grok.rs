@@ -885,6 +885,7 @@ fn scan_grok_with_hooks(
                             source: primary,
                             required_sidecars: sidecars,
                             conversations_emitted: 1,
+                            tail: None,
                         })?;
                     }
                 }
