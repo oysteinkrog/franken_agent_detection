@@ -2806,12 +2806,12 @@ not valid json at all
         lines.push(usage(26));
         lines.push(assistant(27));
         // An empty user record adds no message, so no cut falls before it.
-        lines.extend((28..36).map(assistant));
-        lines.push(usage(36));
+        lines.extend((28..30).map(assistant));
+        lines.push(usage(30));
         lines.push(
             json!({"type":"response_item","payload":{"type":"message","role":"user","content":""}}),
         );
-        lines.push(usage(37));
+        lines.push(usage(31));
         let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
         fs::write(sessions.join("rollout-steps.jsonl"), &text).unwrap();
         let ctx = ScanContext::local_default(codex_dir.clone(), None);
@@ -2830,7 +2830,7 @@ not valid json at all
         // Each cut falls right before an assistant answer, once the part
         // holds 8 messages, so no usage record is parted from its answer.
         let sizes: Vec<usize> = parts.iter().map(|part| part.messages.len()).collect();
-        assert_eq!(sizes, vec![8, 9, 8, 9]);
+        assert_eq!(sizes, vec![8, 9, 8, 3]);
         let joined: Vec<&NormalizedMessage> =
             parts.iter().flat_map(|part| part.messages.iter()).collect();
         assert_eq!(joined.len(), whole[0].messages.len());
