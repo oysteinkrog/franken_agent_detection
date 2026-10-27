@@ -440,6 +440,8 @@ fn is_token_count_record(val: &Value) -> bool {
             == Some("token_count")
 }
 
+/// A record the scan turns into a user message. Records it skips (no text)
+/// are not, so a part never ends before a record that adds nothing.
 fn is_user_prompt_record(val: &Value) -> bool {
     let payload = val.get("payload");
     let payload_type = payload.and_then(|p| p.get("type")).and_then(Value::as_str);
@@ -447,8 +449,17 @@ fn is_user_prompt_record(val: &Value) -> bool {
         Some("response_item") => {
             matches!(payload_type, None | Some("message"))
                 && payload.and_then(|p| p.get("role")).and_then(Value::as_str) == Some("user")
+                && payload
+                    .and_then(|p| p.get("content"))
+                    .is_some_and(|content| !flatten_content(content).trim().is_empty())
         }
-        Some("event_msg") => payload_type == Some("user_message"),
+        Some("event_msg") => {
+            payload_type == Some("user_message")
+                && payload
+                    .and_then(|p| p.get("message"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+        }
         _ => false,
     }
 }
@@ -2794,6 +2805,13 @@ not valid json at all
         lines.push(usage(25));
         lines.push(usage(26));
         lines.push(assistant(27));
+        // An empty user record adds no message, so no cut falls before it.
+        lines.extend((28..36).map(assistant));
+        lines.push(usage(36));
+        lines.push(
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":""}}),
+        );
+        lines.push(usage(37));
         let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
         fs::write(sessions.join("rollout-steps.jsonl"), &text).unwrap();
         let ctx = ScanContext::local_default(codex_dir.clone(), None);
@@ -2812,7 +2830,7 @@ not valid json at all
         // Each cut falls right before an assistant answer, once the part
         // holds 8 messages, so no usage record is parted from its answer.
         let sizes: Vec<usize> = parts.iter().map(|part| part.messages.len()).collect();
-        assert_eq!(sizes, vec![8, 9, 8, 1]);
+        assert_eq!(sizes, vec![8, 9, 8, 9]);
         let joined: Vec<&NormalizedMessage> =
             parts.iter().flat_map(|part| part.messages.iter()).collect();
         assert_eq!(joined.len(), whole[0].messages.len());
