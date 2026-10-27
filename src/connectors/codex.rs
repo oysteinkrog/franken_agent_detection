@@ -403,6 +403,34 @@ fn codex_title(messages: &[NormalizedMessage]) -> Option<String> {
 }
 
 /// Whether a rollout record is a user prompt, the start of a turn.
+/// A record the scan turns into an assistant message that `token_count`
+/// usage attaches to (see `is_token_usage_target_message`).
+fn is_usage_target_record(val: &Value) -> bool {
+    if val.get("type").and_then(Value::as_str) != Some("response_item") {
+        return false;
+    }
+    let Some(payload) = val.get("payload") else {
+        return false;
+    };
+    if matches!(
+        payload.get("type").and_then(Value::as_str),
+        Some(
+            "function_call"
+                | "custom_tool_call"
+                | "function_call_output"
+                | "custom_tool_call_output"
+        )
+    ) || payload.get("role").and_then(Value::as_str) != Some("assistant")
+    {
+        return false;
+    }
+    let Some(content) = payload.get("content") else {
+        return false;
+    };
+    !flatten_content(content).trim().is_empty()
+        && extract_invocations_from_content_blocks(content).is_empty()
+}
+
 fn is_token_count_record(val: &Value) -> bool {
     val.get("type").and_then(Value::as_str) == Some("event_msg")
         && val
@@ -448,7 +476,7 @@ fn codex_part_limits() -> (usize, usize) {
 /// sessions are, so memory stays bounded whatever the rollout size. A part
 /// ends where a user prompt starts a turn, so a turn's token usage lands on its
 /// own assistant message; one turn four times over the limit is split inside,
-/// after the usage of one of its model steps.
+/// right before an assistant message that usage can attach to.
 /// Parts share the external id, get consecutive idx and carry their byte range
 /// in the rollout as `metadata.part`, so cass enriches each part from its own
 /// records.
@@ -461,45 +489,34 @@ struct CodexParts {
     counted: usize,
     content_bytes: usize,
     title: Option<Option<String>>,
-    /// The record before the next one was a `token_count`.
-    after_token_count: bool,
-    /// Where the current model step started: messages, content bytes and
-    /// file offset, at the record after the last `token_count`.
-    step_start: (usize, usize, u64),
 }
 
 impl CodexParts {
     /// Whether to end the part before the next record. `part_end` is where
     /// that record starts. Records FAD does not turn into messages (tool
     /// results, for one) count by their bytes, because cass enriches the part
-    /// from them. A cut inside a turn falls right after a `token_count`
-    /// record (a run of them counts as one), where a model step ends, so
-    /// usage stays with its assistant message. Only one model step 8 times
-    /// over the limit on its own is cut anywhere else.
+    /// from them. A cut inside a turn falls right before an assistant message
+    /// that `token_count` usage attaches to: usage after it can only attach to
+    /// it or to later messages, never to the part before. Only a stretch 4
+    /// times over the limit with no such message is cut anywhere else, and
+    /// then never right before a `token_count`.
     fn should_cut(&mut self, messages: &[NormalizedMessage], part_end: u64, next: &Value) -> bool {
         for message in &messages[self.counted.min(messages.len())..] {
             self.content_bytes = self.content_bytes.saturating_add(message.content.len());
         }
         self.counted = messages.len();
-        let next_is_usage = is_token_count_record(next);
-        let after_step = std::mem::replace(&mut self.after_token_count, next_is_usage);
-        if after_step {
-            self.step_start = (messages.len(), self.content_bytes, part_end);
-        }
         let (max_messages, max_bytes) = codex_part_limits();
-        let over = |since: (usize, usize, u64), times: usize| {
-            let bytes = usize::try_from(part_end.saturating_sub(since.2)).unwrap_or(usize::MAX);
-            messages.len().saturating_sub(since.0) >= max_messages.saturating_mul(times)
-                || self.content_bytes.saturating_sub(since.1) >= max_bytes.saturating_mul(times)
-                || bytes >= max_bytes.saturating_mul(times)
+        let record_bytes =
+            usize::try_from(part_end.saturating_sub(self.byte_start)).unwrap_or(usize::MAX);
+        let over = |times: usize| {
+            messages.len() >= max_messages.saturating_mul(times)
+                || self.content_bytes >= max_bytes.saturating_mul(times)
+                || record_bytes >= max_bytes.saturating_mul(times)
         };
-        let part_start = (0, 0, self.byte_start);
-        let full = messages.len() >= max_messages
-            || self.content_bytes >= max_bytes
-            || over(part_start, 2);
+        let full = messages.len() >= max_messages || self.content_bytes >= max_bytes || over(2);
         (full && is_user_prompt_record(next))
-            || (!next_is_usage && after_step && over(part_start, 4))
-            || (!next_is_usage && over(self.step_start, 8))
+            || (over(4) && is_usage_target_record(next))
+            || (over(8) && !is_token_count_record(next))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -548,7 +565,6 @@ impl CodexParts {
         self.byte_start = byte_end;
         self.counted = 0;
         self.content_bytes = 0;
-        self.step_start = (0, 0, byte_end);
         conversation
     }
 }
@@ -2697,7 +2713,7 @@ not valid json at all
         let ctx = ScanContext::local_default(codex_dir.clone(), None);
         let whole = CodexConnector::new().scan(&ctx).unwrap();
 
-        TEST_CODEX_PART_LIMITS.with(|limits| limits.set(Some((2, 1_000))));
+        TEST_CODEX_PART_LIMITS.with(|limits| limits.set(Some((2, 100))));
         let mut completions = Vec::new();
         let mut on_complete = |done: &SourceCompletion| {
             completions.push(done.conversations_emitted);
@@ -2793,10 +2809,10 @@ not valid json at all
             .unwrap();
         TEST_CODEX_PART_LIMITS.with(|limits| limits.set(None));
 
-        // Cuts fall after usage 16 and after usage 26, never between a step
-        // and its usage.
+        // Each cut falls right before an assistant answer, once the part
+        // holds 8 messages, so no usage record is parted from its answer.
         let sizes: Vec<usize> = parts.iter().map(|part| part.messages.len()).collect();
-        assert_eq!(sizes, vec![17, 8, 1]);
+        assert_eq!(sizes, vec![8, 9, 8, 1]);
         let joined: Vec<&NormalizedMessage> =
             parts.iter().flat_map(|part| part.messages.iter()).collect();
         assert_eq!(joined.len(), whole[0].messages.len());
