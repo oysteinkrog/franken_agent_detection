@@ -403,6 +403,15 @@ fn codex_title(messages: &[NormalizedMessage]) -> Option<String> {
 }
 
 /// Whether a rollout record is a user prompt, the start of a turn.
+fn is_token_count_record(val: &Value) -> bool {
+    val.get("type").and_then(Value::as_str) == Some("event_msg")
+        && val
+            .get("payload")
+            .and_then(|p| p.get("type"))
+            .and_then(Value::as_str)
+            == Some("token_count")
+}
+
 fn is_user_prompt_record(val: &Value) -> bool {
     let payload = val.get("payload");
     let payload_type = payload.and_then(|p| p.get("type")).and_then(Value::as_str);
@@ -454,19 +463,26 @@ struct CodexParts {
 }
 
 impl CodexParts {
-    fn should_cut(&mut self, messages: &[NormalizedMessage], starts_turn: bool) -> bool {
+    /// Whether to end the part before the next record. `part_end` is where
+    /// that record starts. Records FAD does not turn into messages (tool
+    /// results, for one) count by their bytes, because cass enriches the part
+    /// from them. A cut inside a turn waits for a record that is no
+    /// `token_count`, so usage stays with its assistant message.
+    fn should_cut(&mut self, messages: &[NormalizedMessage], part_end: u64, next: &Value) -> bool {
         for message in &messages[self.counted.min(messages.len())..] {
             self.content_bytes = self.content_bytes.saturating_add(message.content.len());
         }
         self.counted = messages.len();
-        if messages.is_empty() {
-            return false;
-        }
         let (max_messages, max_bytes) = codex_part_limits();
-        let full = messages.len() >= max_messages || self.content_bytes >= max_bytes;
+        let record_bytes =
+            usize::try_from(part_end.saturating_sub(self.byte_start)).unwrap_or(usize::MAX);
+        let full = messages.len() >= max_messages
+            || self.content_bytes >= max_bytes
+            || record_bytes >= max_bytes.saturating_mul(2);
         let far_over = messages.len() >= max_messages.saturating_mul(4)
-            || self.content_bytes >= max_bytes.saturating_mul(4);
-        (full && starts_turn) || far_over
+            || self.content_bytes >= max_bytes.saturating_mul(4)
+            || record_bytes >= max_bytes.saturating_mul(4);
+        (full && is_user_prompt_record(next)) || (far_over && !is_token_count_record(next))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -488,11 +504,11 @@ impl CodexParts {
             message.idx = self.next_idx + i64::try_from(i).unwrap_or(i64::MAX);
         }
         self.next_idx += i64::try_from(messages.len()).unwrap_or(i64::MAX);
-        // Every part carries the title of the first one.
-        let title = self
-            .title
-            .get_or_insert_with(|| codex_title(&messages))
-            .clone();
+        // Every part carries the title of the first part with messages.
+        if self.title.is_none() && !messages.is_empty() {
+            self.title = Some(codex_title(&messages));
+        }
+        let title = self.title.clone().flatten();
         let conversation = NormalizedConversation {
             agent_slug: "codex".to_string(),
             external_id: external_id.clone(),
@@ -668,15 +684,15 @@ fn scan_codex_with_hooks(
             // A long rollout goes out in parts (see `CodexParts`).
             let mut parts = CodexParts::default();
 
+            // Where the next part starts: the bytes read so far.
+            let mut part_end = 0u64;
             if ext == Some("jsonl") {
                 let mut reader = reader::RolloutReader::open(&file, ctx.progress_tick.as_deref())?;
 
-                let mut part_end = 0u64;
                 while let Some((line_idx, val)) = reader.next_record()? {
                     let entry_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     let created = val.get("timestamp").and_then(parse_timestamp);
-                    let starts_turn = is_user_prompt_record(&val);
-                    if parts.should_cut(&messages, starts_turn)
+                    if parts.should_cut(&messages, part_end, &val)
                         && user_prompts.can_cut_before(line_idx)
                     {
                         let part = std::mem::take(&mut messages);
@@ -1030,12 +1046,13 @@ fn scan_codex_with_hooks(
             }
 
             if parts.emitted > 0 {
-                // The rest of a rollout that already went out in parts.
-                if !messages.is_empty() {
-                    let end = file_size_bytes.unwrap_or(parts.byte_start);
+                // The rest of a rollout that already went out in parts. It
+                // goes out even with no messages: cass enriches it from its
+                // records, such as tool results.
+                if !messages.is_empty() || part_end > parts.byte_start {
                     let part = parts.conversation(
                         messages,
-                        end,
+                        part_end,
                         &external_id,
                         &session_cwd,
                         &source_path,
@@ -2619,6 +2636,81 @@ not valid json at all
             assert_eq!(
                 (left.idx, &left.role, &left.content, &left.extra),
                 (right.idx, &right.role, &right.content, &right.extra),
+                "token usage stays on its own assistant message"
+            );
+        }
+    }
+
+    #[test]
+    fn hard_cuts_keep_token_usage_and_trailing_records_reach_a_part() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let mut lines = vec![
+            json!({"type":"response_item","timestamp":"2026-01-01T00:00:00Z",
+            "payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"one long turn"}]}}),
+        ];
+        for step in 0..12 {
+            lines.push(json!({"type":"response_item","timestamp":format!("2026-01-01T00:00:{step:02}Z"),
+                "payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("step {step}")}]}}));
+            // Right where a hard cut falls (8 messages), and at other steps.
+            lines.push(json!({"type":"event_msg","timestamp":format!("2026-01-01T00:00:{step:02}Z"),
+                "payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":step,"output_tokens":1}}}}));
+        }
+        // Records FAD makes no message of, which cass enriches from.
+        for result in 0..20 {
+            lines.push(json!({"type":"event_msg","payload":{"type":"tool_result",
+                "output":format!("result {result} {}", "x".repeat(80))}}));
+        }
+        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        fs::write(sessions.join("rollout-hard.jsonl"), &text).unwrap();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let whole = CodexConnector::new().scan(&ctx).unwrap();
+
+        TEST_CODEX_PART_LIMITS.with(|limits| limits.set(Some((2, 1_000))));
+        let mut completions = Vec::new();
+        let mut on_complete = |done: &SourceCompletion| {
+            completions.push(done.conversations_emitted);
+            Ok(())
+        };
+        let mut hooks = SourceScanHooks {
+            should_scan_source: None,
+            on_source_complete: Some(&mut on_complete),
+            tail_resume: None,
+        };
+        let mut parts = Vec::new();
+        CodexConnector::new()
+            .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
+                parts.push(conversation);
+                Ok(())
+            })
+            .unwrap();
+        TEST_CODEX_PART_LIMITS.with(|limits| limits.set(None));
+
+        assert_eq!(completions, vec![parts.len()]);
+        let mut next_byte = 0;
+        for part in &parts {
+            let range = &part.metadata["part"];
+            assert_eq!(range["byte_start"], next_byte);
+            next_byte = range["byte_end"].as_u64().unwrap();
+        }
+        assert_eq!(
+            next_byte,
+            text.len() as u64,
+            "the parts cover the whole file"
+        );
+        assert!(
+            parts.iter().any(|part| part.messages.is_empty()),
+            "tool results alone fill a part"
+        );
+        let joined: Vec<&NormalizedMessage> =
+            parts.iter().flat_map(|part| part.messages.iter()).collect();
+        assert_eq!(joined.len(), whole[0].messages.len());
+        for (left, right) in joined.iter().zip(&whole[0].messages) {
+            assert_eq!(
+                (left.idx, &left.content, &left.extra),
+                (right.idx, &right.content, &right.extra),
                 "token usage stays on its own assistant message"
             );
         }

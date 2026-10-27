@@ -127,7 +127,10 @@ pub fn chunk_message(message: NormalizedMessage) -> Vec<NormalizedMessage> {
 /// When the original `extra` is neither an object nor null, chunk 0 keeps it
 /// unchanged and has no chunk record.
 #[cfg(feature = "connectors")]
-pub fn chunk_message_at(mut message: NormalizedMessage, chunk_bytes: usize) -> Vec<NormalizedMessage> {
+pub fn chunk_message_at(
+    mut message: NormalizedMessage,
+    chunk_bytes: usize,
+) -> Vec<NormalizedMessage> {
     let chunk_bytes = chunk_bytes.max(4);
     if message.content.len() <= chunk_bytes {
         return vec![message];
@@ -524,7 +527,10 @@ mod tests {
             assert_eq!(record["byte_start"], next);
             next += chunk.content.len();
             assert_eq!(record["byte_end"], next);
-            assert_eq!(&text[record["byte_start"].as_u64().unwrap() as usize..next], chunk.content);
+            assert_eq!(
+                &text[record["byte_start"].as_u64().unwrap() as usize..next],
+                chunk.content
+            );
         }
         // Chunk 0 keeps the original extra and the invocations; the rest carry
         // only the chunk record.

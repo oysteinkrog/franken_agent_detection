@@ -22,6 +22,8 @@ pub use types::DetectionResult;
 pub use types::{
     // Scan & provenance types
     LOCAL_SOURCE_ID,
+    MESSAGE_CHUNK_BYTES,
+    MESSAGE_CHUNK_KEY,
     NormalizedConversation,
     NormalizedInvocation,
     NormalizedMessage,
@@ -30,8 +32,6 @@ pub use types::{
     PathMapping,
     Platform,
     SourceKind,
-    MESSAGE_CHUNK_BYTES,
-    MESSAGE_CHUNK_KEY,
     chunk_message,
     chunk_message_at,
     reindex_messages,
