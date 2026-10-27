@@ -80,6 +80,24 @@ impl UserPrompts {
         });
     }
 
+    /// Whether a part may end before record `next_record_index`: no pending
+    /// prompt could still pair with it.
+    pub(super) fn can_cut_before(&self, next_record_index: usize) -> bool {
+        self.pending
+            .as_ref()
+            .is_none_or(|pending| pending.record_index.saturating_add(1) < next_record_index)
+    }
+
+    /// [`Self::finish`] on a part, then hand the part to `sink`.
+    pub(super) fn finish_into<T>(
+        self,
+        mut messages: Vec<T>,
+        sink: &mut dyn FnMut(Vec<T>) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        self.finish(&mut messages);
+        sink(messages)
+    }
+
     /// Preserve message order and the response-side message with all of its
     /// original metadata. The caller performs its existing reindexing once.
     pub(super) fn finish<T>(self, messages: &mut Vec<T>) {

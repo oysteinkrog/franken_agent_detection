@@ -8,15 +8,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+#[cfg(test)]
 use super::super::utils::MAX_SCAN_FILE_BYTES;
 
 const PROGRESS_LINE_STRIDE: usize = 1024;
 
 /// Largest Codex rollout the primary reader admits. The reader streams records
-/// through a length-bounded handle, so this is an admission budget, not a
-/// memory bound. It defaults to the shared 100 MiB scan budget; an embedder
-/// that admits larger rollouts (cass: `CASS_CODEX_MAX_SOURCE_BYTES`) raises it.
-static ROLLOUT_BYTE_BUDGET: AtomicU64 = AtomicU64::new(MAX_SCAN_FILE_BYTES);
+/// through a length-bounded handle and long rollouts go out in parts, so this
+/// is no memory bound. By default there is no limit: every rollout is read.
+/// An embedder may still set one.
+static ROLLOUT_BYTE_BUDGET: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Set the largest Codex rollout (bytes) the primary reader admits, process-wide.
 /// Values below one byte are treated as one byte.
@@ -89,6 +90,11 @@ impl<'a> RolloutReader<'a> {
             self.finished = true;
         }
         Ok(record)
+    }
+
+    /// Bytes read so far: the offset just past the last record returned.
+    pub(super) fn bytes_read(&self) -> u64 {
+        self.records.bytes_read
     }
 
     fn validate_snapshot(&self) -> Result<()> {
@@ -201,11 +207,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn rollout_admission_is_bounded_by_the_configured_budget() {
+    fn rollout_admission_has_no_default_budget_but_honours_one_set() {
         assert_eq!(
             codex_rollout_byte_budget(),
-            MAX_SCAN_FILE_BYTES,
-            "the default budget is the shared scan budget"
+            u64::MAX,
+            "by default every rollout is read"
         );
         assert!(admit_rollout_len(MAX_SCAN_FILE_BYTES, MAX_SCAN_FILE_BYTES).is_ok());
         let over = admit_rollout_len(MAX_SCAN_FILE_BYTES + 1, MAX_SCAN_FILE_BYTES)

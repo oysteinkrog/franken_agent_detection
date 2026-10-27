@@ -379,6 +379,146 @@ impl CodexConnector {
     }
 }
 
+/// The title: the first line of the first real user prompt, else of the first
+/// message, at most 100 characters.
+fn codex_title(messages: &[NormalizedMessage]) -> Option<String> {
+    messages
+        .iter()
+        .find(|m| m.role == "user" && !is_injected_context_message(&m.content))
+        .map(|m| {
+            m.content
+                .lines()
+                .next()
+                .unwrap_or(&m.content)
+                .chars()
+                .take(100)
+                .collect::<String>()
+        })
+        .or_else(|| {
+            messages
+                .first()
+                .and_then(|m| m.content.lines().next())
+                .map(|s| s.chars().take(100).collect())
+        })
+}
+
+/// Whether a rollout record is a user prompt, the start of a turn.
+fn is_user_prompt_record(val: &Value) -> bool {
+    let payload = val.get("payload");
+    let payload_type = payload.and_then(|p| p.get("type")).and_then(Value::as_str);
+    match val.get("type").and_then(Value::as_str) {
+        Some("response_item") => {
+            matches!(payload_type, None | Some("message"))
+                && payload.and_then(|p| p.get("role")).and_then(Value::as_str) == Some("user")
+        }
+        Some("event_msg") => payload_type == Some("user_message"),
+        _ => false,
+    }
+}
+
+/// Default part size, as for Claude Code sessions.
+const CODEX_PART_MAX_MESSAGES: usize = 8192;
+const CODEX_PART_MAX_CONTENT_BYTES: usize = 16 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CODEX_PART_LIMITS: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn codex_part_limits() -> (usize, usize) {
+    #[cfg(test)]
+    if let Some(limits) = TEST_CODEX_PART_LIMITS.with(std::cell::Cell::get) {
+        return limits;
+    }
+    (CODEX_PART_MAX_MESSAGES, CODEX_PART_MAX_CONTENT_BYTES)
+}
+
+/// A long rollout is handed out in parts of about [`CODEX_PART_MAX_MESSAGES`]
+/// messages or [`CODEX_PART_MAX_CONTENT_BYTES`] of text, as Claude Code
+/// sessions are, so memory stays bounded whatever the rollout size. A part
+/// ends where a user prompt starts a turn, so a turn's token usage lands on its
+/// own assistant message; one turn four times over the limit is split inside.
+/// Parts share the external id, get consecutive idx and carry their byte range
+/// in the rollout as `metadata.part`, so cass enriches each part from its own
+/// records.
+#[derive(Default)]
+struct CodexParts {
+    emitted: usize,
+    next_idx: i64,
+    byte_start: u64,
+    /// Messages already added to `content_bytes`.
+    counted: usize,
+    content_bytes: usize,
+    title: Option<Option<String>>,
+}
+
+impl CodexParts {
+    fn should_cut(&mut self, messages: &[NormalizedMessage], starts_turn: bool) -> bool {
+        for message in &messages[self.counted.min(messages.len())..] {
+            self.content_bytes = self.content_bytes.saturating_add(message.content.len());
+        }
+        self.counted = messages.len();
+        if messages.is_empty() {
+            return false;
+        }
+        let (max_messages, max_bytes) = codex_part_limits();
+        let full = messages.len() >= max_messages || self.content_bytes >= max_bytes;
+        let far_over = messages.len() >= max_messages.saturating_mul(4)
+            || self.content_bytes >= max_bytes.saturating_mul(4);
+        (full && starts_turn) || far_over
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn conversation(
+        &mut self,
+        messages: Vec<NormalizedMessage>,
+        byte_end: u64,
+        external_id: &Option<String>,
+        workspace: &Option<PathBuf>,
+        source_path: &Path,
+        started_at: Option<i64>,
+        ended_at: Option<i64>,
+    ) -> NormalizedConversation {
+        let mut messages: Vec<NormalizedMessage> = messages
+            .into_iter()
+            .flat_map(crate::types::chunk_message)
+            .collect();
+        for (i, message) in messages.iter_mut().enumerate() {
+            message.idx = self.next_idx + i64::try_from(i).unwrap_or(i64::MAX);
+        }
+        self.next_idx += i64::try_from(messages.len()).unwrap_or(i64::MAX);
+        // Every part carries the title of the first one.
+        let title = self
+            .title
+            .get_or_insert_with(|| codex_title(&messages))
+            .clone();
+        let conversation = NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: external_id.clone(),
+            title,
+            workspace: workspace.clone(),
+            source_path: source_path.to_path_buf(),
+            started_at,
+            ended_at,
+            metadata: serde_json::json!({
+                "source": "rollout",
+                "part": {
+                    "ordinal": self.emitted,
+                    "byte_start": self.byte_start,
+                    "byte_end": byte_end,
+                },
+            }),
+            messages,
+        };
+        self.emitted += 1;
+        self.byte_start = byte_end;
+        self.counted = 0;
+        self.content_bytes = 0;
+        conversation
+    }
+}
+
 fn update_time_bounds(started_at: &mut Option<i64>, ended_at: &mut Option<i64>, ts: Option<i64>) {
     if let Some(ts) = ts {
         *started_at = Some(started_at.map_or(ts, |curr| curr.min(ts)));
@@ -525,14 +665,33 @@ fn scan_codex_with_hooks(
             // Pair individual records, not all occurrences of prompt text.
             // Capture stream/turn identity before large-message extra compaction.
             let mut user_prompts = user_prompts::UserPrompts::default();
+            // A long rollout goes out in parts (see `CodexParts`).
+            let mut parts = CodexParts::default();
 
             if ext == Some("jsonl") {
                 let mut reader = reader::RolloutReader::open(&file, ctx.progress_tick.as_deref())?;
 
-                // Accumulate privately until the complete opened snapshot is validated.
+                let mut part_end = 0u64;
                 while let Some((line_idx, val)) = reader.next_record()? {
                     let entry_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     let created = val.get("timestamp").and_then(parse_timestamp);
+                    let starts_turn = is_user_prompt_record(&val);
+                    if parts.should_cut(&messages, starts_turn)
+                        && user_prompts.can_cut_before(line_idx)
+                    {
+                        let part = std::mem::take(&mut messages);
+                        std::mem::take(&mut user_prompts).finish_into(part, &mut |part| {
+                            on_conversation(parts.conversation(
+                                part,
+                                part_end,
+                                &external_id,
+                                &session_cwd,
+                                &source_path,
+                                started_at,
+                                ended_at,
+                            ))
+                        })?;
+                    }
 
                     match entry_type {
                         "session_meta" => {
@@ -805,13 +964,9 @@ fn scan_codex_with_hooks(
                         }
                         _ => {}
                     }
+                    part_end = reader.bytes_read();
                 }
                 user_prompts.finish(&mut messages);
-                messages = messages
-                    .into_iter()
-                    .flat_map(crate::types::chunk_message)
-                    .collect();
-                crate::types::reindex_messages(&mut messages);
             } else if ext == Some("json") {
                 // Legacy single-file rollouts can be huge; enforce the
                 // project's 100MB scan cap (chatgpt policy).
@@ -872,35 +1027,44 @@ fn scan_codex_with_hooks(
                         });
                     }
                 }
-                messages = messages
-                    .into_iter()
-                    .flat_map(crate::types::chunk_message)
-                    .collect();
-                crate::types::reindex_messages(&mut messages);
             }
+
+            if parts.emitted > 0 {
+                // The rest of a rollout that already went out in parts.
+                if !messages.is_empty() {
+                    let end = file_size_bytes.unwrap_or(parts.byte_start);
+                    let part = parts.conversation(
+                        messages,
+                        end,
+                        &external_id,
+                        &session_cwd,
+                        &source_path,
+                        started_at,
+                        ended_at,
+                    );
+                    on_conversation(part)?;
+                }
+                if !discovered.fs_metadata_changed() {
+                    hooks.complete(&SourceCompletion {
+                        source: discovered,
+                        required_sidecars: Vec::new(),
+                        conversations_emitted: parts.emitted,
+                        tail: None,
+                    })?;
+                }
+                continue;
+            }
+            messages = messages
+                .into_iter()
+                .flat_map(crate::types::chunk_message)
+                .collect();
+            crate::types::reindex_messages(&mut messages);
 
             if messages.is_empty() {
                 continue;
             }
 
-            let title = messages
-                .iter()
-                .find(|m| m.role == "user" && !is_injected_context_message(&m.content))
-                .map(|m| {
-                    m.content
-                        .lines()
-                        .next()
-                        .unwrap_or(&m.content)
-                        .chars()
-                        .take(100)
-                        .collect::<String>()
-                })
-                .or_else(|| {
-                    messages
-                        .first()
-                        .and_then(|m| m.content.lines().next())
-                        .map(|s| s.chars().take(100).collect())
-                });
+            let title = codex_title(&messages);
 
             on_conversation(NormalizedConversation {
                 agent_slug: "codex".to_string(),
@@ -2376,12 +2540,88 @@ not valid json at all
         let joined = format!("{}{}", messages[1].content, messages[2].content);
         assert_eq!(joined, output);
         assert_eq!(
-            messages[1].extra.pointer("/payload/call_id").and_then(Value::as_str),
+            messages[1]
+                .extra
+                .pointer("/payload/call_id")
+                .and_then(Value::as_str),
             Some("call_1"),
             "chunk 0 keeps the raw record"
         );
-        assert_eq!(messages[2].extra[crate::types::MESSAGE_CHUNK_KEY]["ordinal"], 1);
+        assert_eq!(
+            messages[2].extra[crate::types::MESSAGE_CHUNK_KEY]["ordinal"],
+            1
+        );
         assert_eq!(messages[3].content, "done");
+    }
+
+    #[test]
+    fn a_long_rollout_goes_out_in_parts_that_add_up_to_the_whole() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let mut lines = vec![json!({"type":"session_meta","payload":{"cwd":"/work"}})];
+        for turn in 0..20 {
+            lines.push(json!({"type":"response_item","timestamp":format!("2026-01-01T00:{turn:02}:00Z"),
+                "payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("prompt {turn}")}]}}));
+            lines.push(json!({"type":"response_item","timestamp":format!("2026-01-01T00:{turn:02}:01Z"),
+                "payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("answer {turn}")}]}}));
+            lines.push(json!({"type":"event_msg","timestamp":format!("2026-01-01T00:{turn:02}:02Z"),
+                "payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":turn,"output_tokens":1}}}}));
+        }
+        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        let path = sessions.join("rollout-long.jsonl");
+        fs::write(&path, &text).unwrap();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let whole = CodexConnector::new().scan(&ctx).unwrap();
+        assert_eq!(whole.len(), 1);
+
+        TEST_CODEX_PART_LIMITS.with(|limits| limits.set(Some((5, usize::MAX))));
+        let mut completions = Vec::new();
+        let mut on_complete = |done: &SourceCompletion| {
+            completions.push(done.conversations_emitted);
+            Ok(())
+        };
+        let mut hooks = SourceScanHooks {
+            should_scan_source: None,
+            on_source_complete: Some(&mut on_complete),
+            tail_resume: None,
+        };
+        let mut parts = Vec::new();
+        CodexConnector::new()
+            .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
+                parts.push(conversation);
+                Ok(())
+            })
+            .unwrap();
+        TEST_CODEX_PART_LIMITS.with(|limits| limits.set(None));
+
+        assert!(parts.len() > 3, "{} parts", parts.len());
+        assert_eq!(completions, vec![parts.len()]);
+        let mut next_byte = 0;
+        for (ordinal, part) in parts.iter().enumerate() {
+            assert_eq!(part.external_id, whole[0].external_id);
+            assert_eq!(part.title, whole[0].title);
+            let range = &part.metadata["part"];
+            assert_eq!(range["ordinal"], ordinal);
+            assert_eq!(range["byte_start"], next_byte);
+            next_byte = range["byte_end"].as_u64().unwrap();
+            // A part starts at a user prompt (the first one after the meta).
+            if ordinal > 0 {
+                assert_eq!(part.messages[0].role, "user");
+            }
+        }
+        assert_eq!(next_byte, text.len() as u64);
+        let joined: Vec<&NormalizedMessage> =
+            parts.iter().flat_map(|part| part.messages.iter()).collect();
+        assert_eq!(joined.len(), whole[0].messages.len());
+        for (left, right) in joined.iter().zip(&whole[0].messages) {
+            assert_eq!(
+                (left.idx, &left.role, &left.content, &left.extra),
+                (right.idx, &right.role, &right.content, &right.extra),
+                "token usage stays on its own assistant message"
+            );
+        }
     }
 
     #[test]
