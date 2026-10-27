@@ -2604,6 +2604,9 @@ not valid json at all
         for turn in 0..20 {
             lines.push(json!({"type":"response_item","timestamp":format!("2026-01-01T00:{turn:02}:00Z"),
                 "payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("prompt {turn}")}]}}));
+            // As in real rollouts, the answer is not the record right after
+            // the prompt, which may still pair with the prompt's event copy.
+            lines.push(json!({"type":"response_item","payload":{"type":"reasoning"}}));
             lines.push(json!({"type":"response_item","timestamp":format!("2026-01-01T00:{turn:02}:01Z"),
                 "payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("answer {turn}")}]}}));
             lines.push(json!({"type":"event_msg","timestamp":format!("2026-01-01T00:{turn:02}:02Z"),
