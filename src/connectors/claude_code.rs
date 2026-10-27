@@ -655,10 +655,23 @@ struct ClaudeJsonlParser {
     messages: Vec<NormalizedMessage>,
     content_bytes: usize,
     compact_message_extra: bool,
+    /// Set while a line with deferred strings is ingested: its messages wait
+    /// in `deferred` until their strings are read back from the file.
+    defer: bool,
+    deferred: Vec<NormalizedMessage>,
 }
 
 impl ClaudeJsonlParser {
     fn push(&mut self, message: NormalizedMessage) {
+        if self.defer {
+            self.deferred.push(message);
+            return;
+        }
+        self.push_ready(message);
+    }
+
+    /// Push a message whose text is final.
+    fn push_ready(&mut self, message: NormalizedMessage) {
         if self.state.first_user_title.is_none() && message.role == "user" {
             self.state.first_user_title = Some(first_line_title(&message.content));
         }
@@ -934,6 +947,291 @@ fn long_line_keep_bytes() -> usize {
         .unwrap_or(DEFAULT_LONG_LINE_KEEP_BYTES)
 }
 
+/// Deferred strings of one long line, read back from a second handle on the
+/// same file.
+struct LongLineStrings {
+    file: std::io::BufReader<fs::File>,
+    line_start: u64,
+    strings: Vec<super::long_jsonl_line::LongString>,
+}
+
+enum TextPiece<'a> {
+    Text(&'a str),
+    Long(usize),
+}
+
+/// Split `text` into literal text and deferred-string tokens. Anything that
+/// only looks like a token (bad index) stays literal text.
+fn text_pieces(text: &str, count: usize) -> Vec<TextPiece<'_>> {
+    use super::long_jsonl_line::{LONG_STRING_TOKEN_END, LONG_STRING_TOKEN_START};
+    let mut pieces = Vec::new();
+    let mut rest = text;
+    let mut literal_from = 0;
+    let mut pos = 0;
+    while let Some(found) = rest.find(LONG_STRING_TOKEN_START) {
+        let at = pos + found;
+        let after = &text[at + LONG_STRING_TOKEN_START.len_utf8()..];
+        let index = after
+            .strip_prefix("long-string:")
+            .and_then(|tail| tail.split_once(LONG_STRING_TOKEN_END))
+            .and_then(|(digits, _)| digits.parse::<usize>().ok().map(|n| (n, digits.len())))
+            .filter(|&(n, _)| n < count);
+        if let Some((n, digits)) = index {
+            if literal_from < at {
+                pieces.push(TextPiece::Text(&text[literal_from..at]));
+            }
+            pieces.push(TextPiece::Long(n));
+            let end = at
+                + LONG_STRING_TOKEN_START.len_utf8()
+                + "long-string:".len()
+                + digits
+                + LONG_STRING_TOKEN_END.len_utf8();
+            literal_from = end;
+            pos = end;
+        } else {
+            pos = at + LONG_STRING_TOKEN_START.len_utf8();
+        }
+        rest = &text[pos..];
+    }
+    if literal_from < text.len() {
+        pieces.push(TextPiece::Text(&text[literal_from..]));
+    }
+    pieces
+}
+
+/// In fields cass does not index (invocation arguments, `extra`, snippets),
+/// a deferred string becomes a short note; its text is in the message.
+fn note_long_strings(text: &str, strings: &[super::long_jsonl_line::LongString]) -> String {
+    text_pieces(text, strings.len())
+        .into_iter()
+        .map(|piece| match piece {
+            TextPiece::Text(text) => text.to_string(),
+            TextPiece::Long(n) => format!("[long string of {} bytes]", strings[n].len),
+        })
+        .collect()
+}
+
+fn note_long_strings_in_value(value: &mut Value, strings: &[super::long_jsonl_line::LongString]) {
+    match value {
+        Value::String(text) => {
+            if text.contains(super::long_jsonl_line::LONG_STRING_TOKEN_START) {
+                *text = note_long_strings(text, strings);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                note_long_strings_in_value(item, strings);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                note_long_strings_in_value(item, strings);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Writes the text of one message as chunks of at most `chunk_bytes`,
+/// handing each to `out` as soon as the next one starts, so the message is
+/// never whole in memory.
+struct ChunkWriter {
+    /// The message itself, sent as chunk 0.
+    template: Option<NormalizedMessage>,
+    /// Role, author and time for the later chunks.
+    first: (String, Option<String>, Option<i64>),
+    group: String,
+    total: u64,
+    chunk_bytes: usize,
+    buf: Vec<u8>,
+    held: Option<Vec<u8>>,
+    ordinal: usize,
+    sent_bytes: u64,
+}
+
+impl ChunkWriter {
+    fn feed(
+        &mut self,
+        bytes: &[u8],
+        out: &mut dyn FnMut(NormalizedMessage) -> Result<()>,
+    ) -> Result<()> {
+        self.buf.extend_from_slice(bytes);
+        while self.buf.len() > self.chunk_bytes {
+            // Pieces are whole characters; cut before a continuation byte.
+            let mut cut = self.chunk_bytes;
+            while cut > 0 && (self.buf[cut] & 0xC0) == 0x80 {
+                cut -= 1;
+            }
+            let piece: Vec<u8> = self.buf.drain(..cut).collect();
+            if let Some(previous) = self.held.replace(piece) {
+                self.send(previous, false, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, out: &mut dyn FnMut(NormalizedMessage) -> Result<()>) -> Result<()> {
+        if !self.buf.is_empty() || self.held.is_none() {
+            let piece = std::mem::take(&mut self.buf);
+            if let Some(previous) = self.held.replace(piece) {
+                self.send(previous, false, out)?;
+            }
+        }
+        let last = self.held.take().unwrap_or_default();
+        if self.ordinal == 0 {
+            // It fit in one chunk after all: a plain message.
+            let mut message = self.template.take().context("message already sent")?;
+            message.content = String::from_utf8(last).context("decoded text is not UTF-8")?;
+            return out(message);
+        }
+        self.send(last, true, out)
+    }
+
+    fn send(
+        &mut self,
+        piece: Vec<u8>,
+        last: bool,
+        out: &mut dyn FnMut(NormalizedMessage) -> Result<()>,
+    ) -> Result<()> {
+        let content = String::from_utf8(piece).context("decoded text is not UTF-8")?;
+        let byte_start = self.sent_bytes;
+        self.sent_bytes += content.len() as u64;
+        let record = serde_json::json!({
+            "group": self.group,
+            "ordinal": self.ordinal,
+            "byte_start": byte_start,
+            "byte_end": self.sent_bytes,
+            "total_bytes": self.total,
+            "last": last,
+        });
+        let message = if self.ordinal == 0 {
+            let mut message = self.template.take().context("message already sent")?;
+            match &mut message.extra {
+                Value::Object(map) => {
+                    map.insert(crate::types::MESSAGE_CHUNK_KEY.to_string(), record);
+                }
+                Value::Null => {
+                    let mut map = Map::new();
+                    map.insert(crate::types::MESSAGE_CHUNK_KEY.to_string(), record);
+                    message.extra = Value::Object(map);
+                }
+                _ => {}
+            }
+            message.content = content;
+            message
+        } else {
+            let first = &self.first;
+            let mut extra = Map::new();
+            extra.insert(crate::types::MESSAGE_CHUNK_KEY.to_string(), record);
+            NormalizedMessage {
+                idx: 0,
+                role: first.0.clone(),
+                author: first.1.clone(),
+                created_at: first.2,
+                content,
+                extra: Value::Object(extra),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }
+        };
+        self.ordinal += 1;
+        out(message)
+    }
+}
+
+/// Write a message from a long line whose text holds deferred-string
+/// tokens: each string is read back from the file and the text goes to `out`
+/// in chunks as it is decoded. Returns `Ok(false)` when the file no longer
+/// holds the strings the first pass found (it changed in between).
+fn expand_long_message(
+    mut message: NormalizedMessage,
+    strings: &mut LongLineStrings,
+    index_in_line: usize,
+    chunk_bytes: usize,
+    out: &mut dyn FnMut(NormalizedMessage) -> Result<()>,
+) -> Result<bool> {
+    use std::io::{Seek, SeekFrom};
+    for invocation in &mut message.invocations {
+        if let Some(arguments) = &mut invocation.arguments {
+            note_long_strings_in_value(arguments, &strings.strings);
+        }
+    }
+    note_long_strings_in_value(&mut message.extra, &strings.strings);
+    for snippet in &mut message.snippets {
+        if let Some(text) = &mut snippet.snippet_text {
+            *text = note_long_strings(text, &strings.strings);
+        }
+    }
+    let content = std::mem::take(&mut message.content);
+    let pieces = text_pieces(&content, strings.strings.len());
+    if !pieces
+        .iter()
+        .any(|piece| matches!(piece, TextPiece::Long(_)))
+    {
+        message.content = content;
+        for chunk in crate::types::chunk_message_at(message, chunk_bytes) {
+            out(chunk)?;
+        }
+        return Ok(true);
+    }
+    let total: u64 = pieces
+        .iter()
+        .map(|piece| match piece {
+            TextPiece::Text(text) => text.len() as u64,
+            TextPiece::Long(n) => strings.strings[*n].len,
+        })
+        .sum();
+    let group = blake3::hash(
+        format!("long-line:{}:{index_in_line}:{total}", strings.line_start).as_bytes(),
+    )
+    .to_hex();
+    let mut writer = ChunkWriter {
+        first: (
+            message.role.clone(),
+            message.author.clone(),
+            message.created_at,
+        ),
+        template: Some(message),
+        group: group.as_str()[..16].to_string(),
+        total,
+        chunk_bytes: chunk_bytes.max(4),
+        buf: Vec::new(),
+        held: None,
+        ordinal: 0,
+        sent_bytes: 0,
+    };
+    for piece in pieces {
+        match piece {
+            TextPiece::Text(text) => writer.feed(text.as_bytes(), out)?,
+            TextPiece::Long(n) => {
+                let long = strings.strings[n];
+                strings
+                    .file
+                    .seek(SeekFrom::Start(strings.line_start + long.start))?;
+                let mut failed = None;
+                let decoded = super::long_jsonl_line::decode_string_at(
+                    &mut strings.file,
+                    &mut |bytes: &[u8]| {
+                        if failed.is_none()
+                            && let Err(error) = writer.feed(bytes, out)
+                        {
+                            failed = Some(error);
+                        }
+                    },
+                );
+                if let Some(error) = failed {
+                    return Err(error);
+                }
+                if decoded != Some(long.len) {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    writer.finish(out)?;
+    Ok(true)
+}
+
 fn max_line_bytes() -> usize {
     #[cfg(test)]
     if let Some(cap) = TEST_MAX_LINE_BYTES.with(std::cell::Cell::get) {
@@ -1158,6 +1456,10 @@ fn parse_claude_jsonl_source(
     let readable = options
         .size_limit
         .map_or(u64::MAX, |limit| limit.saturating_sub(start));
+    // A long line's deferred strings are read back through a second handle,
+    // which must be this same file.
+    let file_identity = open_file_identity(&file);
+    let mut long_file: Option<std::io::BufReader<fs::File>> = None;
     let mut reader = std::io::BufReader::with_capacity(256 * 1024, file.take(readable));
 
     let mut parser = ClaudeJsonlParser {
@@ -1165,6 +1467,8 @@ fn parse_claude_jsonl_source(
         messages: Vec::new(),
         content_bytes: 0,
         compact_message_extra: options.compact_message_extra,
+        defer: false,
+        deferred: Vec::new(),
     };
     let mut offset = start;
     // Set once the session is split: the title every part carries.
@@ -1199,8 +1503,10 @@ fn parse_claude_jsonl_source(
         line.clear();
         let read = match read_line_capped(&mut reader, &mut line, max_line, false) {
             Ok((_, true)) => {
-                // Too long to buffer: stream the rest of it, keeping a
-                // bounded part of its text, then go on with the next line.
+                // Too long to buffer: stream it in two passes. The first
+                // checks the whole line and keeps its structure, leaving long
+                // strings in the file; the second reads those strings back
+                // and writes their text out in chunks as it decodes them.
                 let keep = long_line_keep_bytes();
                 let mut tail_bytes = Vec::new();
                 let mut rest = std::io::Read::chain(&line[..], &mut reader);
@@ -1209,30 +1515,103 @@ fn parse_claude_jsonl_source(
                     keep,
                     &mut tail_bytes,
                     SOURCE_TAIL_PREFIX_BYTES,
+                    true,
                 ) {
                     super::long_jsonl_line::LongLine::Parsed {
                         value,
                         consumed,
                         truncated_strings,
                         dropped_values,
+                        long_strings,
                     } => {
-                        tracing::warn!(
-                            path = %path.display(),
-                            offset,
-                            line_bytes = consumed,
-                            kept_bytes = keep,
-                            truncated_strings,
-                            dropped_values,
-                            "claude_code line longer than FAD_CLAUDE_MAX_LINE_BYTES; indexed with its text cut"
-                        );
+                        let line_start = offset;
                         offset += consumed;
+                        if truncated_strings > 0 || dropped_values > 0 {
+                            tracing::warn!(
+                                path = %path.display(),
+                                offset = line_start,
+                                line_bytes = consumed,
+                                truncated_strings,
+                                dropped_values,
+                                "claude_code long line indexed with some values cut"
+                            );
+                        }
                         cut_values = cut_values
                             .saturating_add(truncated_strings)
                             .saturating_add(dropped_values);
                         if options.wants_tail {
                             push_tail_prefix(&mut prefix, &tail_bytes);
                         }
-                        parser.ingest_line(value);
+                        if long_strings.is_empty() {
+                            parser.ingest_line(value);
+                        } else {
+                            parser.defer = true;
+                            parser.ingest_line(value);
+                            parser.defer = false;
+                            if long_file.is_none() {
+                                long_file = fs::File::open(path)
+                                    .ok()
+                                    .filter(|f| {
+                                        file_identity.is_some()
+                                            && open_file_identity(f) == file_identity
+                                    })
+                                    .map(|f| std::io::BufReader::with_capacity(256 * 1024, f));
+                            }
+                            let Some(file) = long_file.take() else {
+                                tracing::warn!(path = %path.display(), "claude_code file changed while a long line was read; stopping");
+                                cut_values = cut_values.saturating_add(1);
+                                break;
+                            };
+                            let mut strings = LongLineStrings {
+                                file,
+                                line_start,
+                                strings: long_strings,
+                            };
+                            let chunk_bytes = message_chunk_bytes();
+                            let mut matched = true;
+                            for (index, message) in
+                                std::mem::take(&mut parser.deferred).into_iter().enumerate()
+                            {
+                                matched = expand_long_message(
+                                    message,
+                                    &mut strings,
+                                    index,
+                                    chunk_bytes,
+                                    &mut |chunk| {
+                                        parser.push_ready(chunk);
+                                        // Hand out a part as soon as it is
+                                        // full, also inside one message.
+                                        if parser.messages.len() >= options.limits.max_messages
+                                            || parser.content_bytes
+                                                >= options.limits.max_content_bytes
+                                        {
+                                            if part_title.is_none() {
+                                                let remaining = start
+                                                    .saturating_add(readable)
+                                                    .saturating_sub(offset);
+                                                part_title = Some(scan_final_ai_title(
+                                                    path,
+                                                    offset,
+                                                    remaining,
+                                                    parser.state.json_title.clone(),
+                                                ));
+                                            }
+                                            emit(&mut parser, part_title.as_ref(), &mut next_idx)?;
+                                        }
+                                        Ok(())
+                                    },
+                                )?;
+                                if !matched {
+                                    break;
+                                }
+                            }
+                            long_file = Some(strings.file);
+                            if !matched {
+                                tracing::warn!(path = %path.display(), "claude_code file changed while a long line was read; stopping");
+                                cut_values = cut_values.saturating_add(1);
+                                break;
+                            }
+                        }
                     }
                     super::long_jsonl_line::LongLine::Invalid { consumed } => {
                         offset += consumed;
@@ -3853,12 +4232,14 @@ mod tests {
     }
 
     #[test]
-    fn a_line_longer_than_the_cap_is_indexed_cut_and_the_session_goes_on() {
+    fn a_line_longer_than_the_cap_is_indexed_whole_and_the_session_goes_on() {
         let dir = TempDir::new().unwrap();
         let claude_dir = make_test_claude_dir(dir.path());
         let session = claude_dir.join("session.jsonl");
         let mut lines: Vec<String> = (0..6).map(session_line).collect();
-        let body = "x".repeat(300_000);
+        // Escapes, a surrogate pair and multi-byte characters inside the long
+        // string, so the second pass decodes them as serde_json does.
+        let body = r#"x \"q\" \\ \n é 😀 "#.repeat(20_000);
         lines[3] = session_line(3).replacen("number 3", &format!("number 3 {body}"), 1);
         write_session(&session, &lines);
         let one_shot = ClaudeCodeConnector::new()
@@ -3883,14 +4264,12 @@ mod tests {
         for (i, message) in messages.iter().enumerate() {
             assert_eq!(message.idx, i as i64);
         }
-        let cut = &messages[3].content;
-        assert!(cut.starts_with("message number 3 xxx"));
-        assert!(
-            cut.contains("[truncated while indexing: kept "),
-            "{}",
-            &cut[cut.len() - 80..]
+        assert!(one_shot[0].messages[3].content.len() > 300_000);
+        assert_eq!(
+            messages[3].content, one_shot[0].messages[3].content,
+            "the long message is kept whole"
         );
-        assert!(cut.len() < 9000);
+        assert_eq!(messages[3].role, one_shot[0].messages[3].role);
         // The other messages are as a one-shot parse stores them.
         for i in [0, 1, 2, 4, 5] {
             assert_eq!(
@@ -3898,12 +4277,60 @@ mod tests {
                 message_key(&one_shot[0].messages[i])
             );
         }
+        let tail = completion(&events).tail.clone().unwrap();
+        assert_eq!(tail.offset, fs::metadata(&session).unwrap().len());
+        assert_eq!(tail.next_idx, 6);
+    }
+
+    #[test]
+    fn a_long_line_is_written_in_chunks_and_parts_flush_inside_it() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session = claude_dir.join("session.jsonl");
+        let mut lines: Vec<String> = (0..4).map(session_line).collect();
+        let body = "é€z".repeat(50_000);
+        lines[1] = session_line(1).replacen("number 1", &format!("number 1 {body}"), 1);
+        write_session(&session, &lines);
+        let whole = format!("message number 1 {body}");
+
+        TEST_MAX_LINE_BYTES.with(|cap| cap.set(Some(4096)));
+        TEST_LONG_LINE_KEEP_BYTES.with(|keep| keep.set(Some(8192)));
+        TEST_MESSAGE_CHUNK_BYTES.with(|bytes| bytes.set(Some(100_000)));
+        let events = with_chunk_limits(2, || scan_events(&claude_dir, |_| None));
+        TEST_MAX_LINE_BYTES.with(|cap| cap.set(None));
+        TEST_LONG_LINE_KEEP_BYTES.with(|keep| keep.set(None));
+        TEST_MESSAGE_CHUNK_BYTES.with(|bytes| bytes.set(None));
+
         assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, Event::Complete(_))),
-            "a source with cut text is never certified complete"
+            parts(&events).len() > 2,
+            "parts are handed out inside the message"
         );
+        let messages: Vec<&NormalizedMessage> = parts(&events)
+            .iter()
+            .flat_map(|part| part.messages.iter())
+            .collect();
+        for (i, message) in messages.iter().enumerate() {
+            assert_eq!(message.idx, i as i64);
+        }
+        let chunks = &messages[1..messages.len() - 2];
+        assert!(chunks.len() >= whole.len().div_ceil(100_000));
+        let joined: String = chunks.iter().map(|chunk| chunk.content.as_str()).collect();
+        assert_eq!(joined, whole);
+        let mut next = 0u64;
+        for (ordinal, chunk) in chunks.iter().enumerate() {
+            assert!(chunk.content.len() <= 100_000);
+            assert_eq!(chunk.role, "assistant");
+            let record = &chunk.extra[crate::types::MESSAGE_CHUNK_KEY];
+            assert_eq!(record["ordinal"], ordinal);
+            assert_eq!(record["byte_start"], next);
+            next += chunk.content.len() as u64;
+            assert_eq!(record["byte_end"], next);
+            assert_eq!(record["total_bytes"], whole.len());
+            assert_eq!(record["last"], ordinal == chunks.len() - 1);
+        }
+        assert_eq!(messages[messages.len() - 2].content, "message number 2");
+        let tail = completion(&events).tail.clone().unwrap();
+        assert_eq!(tail.next_idx, messages.len() as i64);
     }
 
     #[test]
@@ -3965,7 +4392,10 @@ mod tests {
             .map(|message| message.content.as_str())
             .collect();
         assert_eq!(joined, format!("message number 1 {body}"));
-        assert_eq!(first_messages[3].extra[crate::types::MESSAGE_CHUNK_KEY]["count"], 3);
+        assert_eq!(
+            first_messages[3].extra[crate::types::MESSAGE_CHUNK_KEY]["count"],
+            3
+        );
         assert_eq!(first_messages[1].role, "assistant");
         let tail = completion(&first).tail.clone().unwrap();
         assert_eq!(tail.next_idx, 6);

@@ -9,6 +9,12 @@
 //! was. Memory stays near the budget whatever the line length, and
 //! every field (type, timestamp, role) is still there, so the line indexes as
 //! a normal message with truncated text.
+//!
+//! With `defer` set, a value string that would be cut is not cut: it becomes
+//! a token naming a [`LongString`], the byte range of that string in the
+//! line. The caller then reads the string again from the file with
+//! [`decode_string_at`], in pieces, so no text is lost and memory stays
+//! bounded.
 
 use serde_json::{Map, Number, Value};
 use std::io::BufRead;
@@ -117,6 +123,27 @@ impl NumberState {
 /// whatever is left of the budget.
 const SMALL_STRING_BYTES: usize = 4096;
 
+/// Most strings one line may defer; later ones are cut as without `defer`.
+const MAX_LONG_STRINGS: usize = 100_000;
+
+/// A value string left in the file: `start` is the offset in the line of the
+/// first byte after its opening quote, `len` its decoded length in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LongString {
+    pub(crate) start: u64,
+    pub(crate) len: u64,
+}
+
+/// Start and end of the token that stands for a deferred string. Both are
+/// Unicode noncharacters, which real text does not use.
+pub(crate) const LONG_STRING_TOKEN_START: char = '\u{FDD0}';
+pub(crate) const LONG_STRING_TOKEN_END: char = '\u{FDD1}';
+
+/// The token for deferred string `index` of a line.
+pub(crate) fn long_string_token(index: usize) -> String {
+    format!("{LONG_STRING_TOKEN_START}long-string:{index}{LONG_STRING_TOKEN_END}")
+}
+
 /// How a streamed line ended.
 #[derive(Debug, PartialEq)]
 pub(crate) enum LongLine {
@@ -128,6 +155,8 @@ pub(crate) enum LongLine {
         truncated_strings: usize,
         /// Values read and dropped past the per-line limits.
         dropped_values: usize,
+        /// Strings left in the file, in token order (with `defer` only).
+        long_strings: Vec<LongString>,
     },
     /// Not valid JSON. The rest of the line was consumed (`consumed` bytes
     /// in all), so parsing can go on with the next line.
@@ -223,6 +252,9 @@ struct Parser {
     pool_left: usize,
     /// The budget each allowance starts with.
     keep_bytes: usize,
+    /// Leave value strings that would be cut in the file (see module docs).
+    defer: bool,
+    long_strings: Vec<LongString>,
 }
 
 impl Parser {
@@ -478,62 +510,24 @@ impl Parser {
         } else {
             self.budget_left.max(small)
         };
+        let start = src.consumed;
         let mut kept: Vec<u8> = Vec::new();
         let mut total: u64 = 0;
         let mut cut = false;
-        let mut push = |bytes: &[u8]| {
+        read_string_bytes(src, &mut |bytes: &[u8]| {
             total += bytes.len() as u64;
             if !cut && kept.len() + bytes.len() <= allowed {
                 kept.extend_from_slice(bytes);
             } else {
                 cut = true;
             }
-        };
-        loop {
-            let byte = src.next()?;
-            match byte {
-                b'"' => break,
-                b'\\' => {
-                    let decoded = match src.next()? {
-                        b'"' => '"',
-                        b'\\' => '\\',
-                        b'/' => '/',
-                        b'b' => '\u{8}',
-                        b'f' => '\u{c}',
-                        b'n' => '\n',
-                        b'r' => '\r',
-                        b't' => '\t',
-                        b'u' => {
-                            let unit = Self::hex4(src)?;
-                            if (0xD800..0xDC00).contains(&unit) {
-                                // A high surrogate needs its low half.
-                                if src.next()? != b'\\' || src.next()? != b'u' {
-                                    return Err(Stop::Invalid);
-                                }
-                                let low = Self::hex4(src)?;
-                                if !(0xDC00..0xE000).contains(&low) {
-                                    return Err(Stop::Invalid);
-                                }
-                                let code = 0x10000
-                                    + ((u32::from(unit) - 0xD800) << 10)
-                                    + (u32::from(low) - 0xDC00);
-                                char::from_u32(code).ok_or(Stop::Invalid)?
-                            } else if (0xDC00..0xE000).contains(&unit) {
-                                return Err(Stop::Invalid);
-                            } else {
-                                char::from_u32(u32::from(unit)).ok_or(Stop::Invalid)?
-                            }
-                        }
-                        _ => return Err(Stop::Invalid),
-                    };
-                    let mut utf8 = [0u8; 4];
-                    push(decoded.encode_utf8(&mut utf8).as_bytes());
-                }
-                // A raw control character (including a newline) is not
-                // allowed inside a JSON string.
-                0x00..=0x1f => return Err(Stop::Invalid),
-                _ => push(&[byte]),
-            }
+        })?;
+        if cut && !key && self.defer && !self.discard && self.long_strings.len() < MAX_LONG_STRINGS
+        {
+            // Leave it in the file; the caller reads it back whole.
+            self.last_string_cut = false;
+            self.long_strings.push(LongString { start, len: total });
+            return Ok(long_string_token(self.long_strings.len() - 1));
         }
         self.last_string_cut = cut;
         if self.discard {
@@ -570,6 +564,85 @@ impl Parser {
     }
 }
 
+/// Decode the rest of a JSON string after its opening quote, handing the
+/// UTF-8 bytes of each character (or run of plain bytes) to `push`. Escapes
+/// and surrogate pairs are checked as `serde_json` checks them.
+fn read_string_bytes<R: BufRead>(
+    src: &mut Source<'_, R>,
+    push: &mut dyn FnMut(&[u8]),
+) -> Result<(), Stop> {
+    loop {
+        let byte = src.next()?;
+        match byte {
+            b'"' => return Ok(()),
+            b'\\' => {
+                let decoded = match src.next()? {
+                    b'"' => '"',
+                    b'\\' => '\\',
+                    b'/' => '/',
+                    b'b' => '\u{8}',
+                    b'f' => '\u{c}',
+                    b'n' => '\n',
+                    b'r' => '\r',
+                    b't' => '\t',
+                    b'u' => {
+                        let unit = Parser::hex4(src)?;
+                        if (0xD800..0xDC00).contains(&unit) {
+                            // A high surrogate needs its low half.
+                            if src.next()? != b'\\' || src.next()? != b'u' {
+                                return Err(Stop::Invalid);
+                            }
+                            let low = Parser::hex4(src)?;
+                            if !(0xDC00..0xE000).contains(&low) {
+                                return Err(Stop::Invalid);
+                            }
+                            let code = 0x10000
+                                + ((u32::from(unit) - 0xD800) << 10)
+                                + (u32::from(low) - 0xDC00);
+                            char::from_u32(code).ok_or(Stop::Invalid)?
+                        } else if (0xDC00..0xE000).contains(&unit) {
+                            return Err(Stop::Invalid);
+                        } else {
+                            char::from_u32(u32::from(unit)).ok_or(Stop::Invalid)?
+                        }
+                    }
+                    _ => return Err(Stop::Invalid),
+                };
+                let mut utf8 = [0u8; 4];
+                push(decoded.encode_utf8(&mut utf8).as_bytes());
+            }
+            // A raw control character (including a newline) is not
+            // allowed inside a JSON string.
+            0x00..=0x1f => return Err(Stop::Invalid),
+            _ => push(&[byte]),
+        }
+    }
+}
+
+/// Decode one JSON string from `reader`, positioned just after its opening
+/// quote, handing its UTF-8 bytes to `push` in pieces. Returns the decoded
+/// length, or `None` when the bytes are not a complete, valid JSON string.
+pub(crate) fn decode_string_at<R: BufRead>(
+    reader: &mut R,
+    push: &mut dyn FnMut(&[u8]),
+) -> Option<u64> {
+    let mut tail = Vec::new();
+    let mut src = Source {
+        reader,
+        consumed: 0,
+        tail: &mut tail,
+        tail_cap: 0,
+        last: None,
+    };
+    let mut total = 0u64;
+    read_string_bytes(&mut src, &mut |bytes: &[u8]| {
+        total += bytes.len() as u64;
+        push(bytes);
+    })
+    .ok()?;
+    Some(total)
+}
+
 /// Parse one line from `reader`, which is positioned at its first byte.
 /// String bytes beyond `keep_bytes` (shared by all strings of the line) are
 /// dropped. `tail` receives the last `tail_cap` (or more) consumed bytes.
@@ -578,6 +651,7 @@ pub(crate) fn parse_long_line<R: BufRead>(
     keep_bytes: usize,
     tail: &mut Vec<u8>,
     tail_cap: usize,
+    defer: bool,
 ) -> LongLine {
     let mut src = Source {
         reader,
@@ -599,6 +673,8 @@ pub(crate) fn parse_long_line<R: BufRead>(
         depth: 0,
         pool_left: POOL_BYTES,
         keep_bytes,
+        defer,
+        long_strings: Vec::new(),
     };
     // A byte order mark may start the line, as in the buffered path.
     let parsed = (|| {
@@ -622,6 +698,7 @@ pub(crate) fn parse_long_line<R: BufRead>(
             consumed: src.consumed,
             truncated_strings: parser.truncated_strings,
             dropped_values: parser.dropped_values,
+            long_strings: parser.long_strings,
         },
         Err(Stop::Eof | Stop::Io) => LongLine::Incomplete,
         Err(Stop::Invalid) => {
@@ -653,7 +730,37 @@ mod tests {
 
     fn parse(text: &str, keep: usize) -> LongLine {
         let mut tail = Vec::new();
-        parse_long_line(&mut text.as_bytes(), keep, &mut tail, 16)
+        parse_long_line(&mut text.as_bytes(), keep, &mut tail, 16, false)
+    }
+
+    #[test]
+    fn deferred_strings_are_tokens_and_decode_back_from_their_offsets() {
+        let long = r#"a \"b\" \\ \n é 😀 "#.repeat(1000);
+        let line = format!(r#"{{"type":"user","message":{{"content":"{long}","k":"short"}}}}"#);
+        let expected: Value = serde_json::from_str(&line).unwrap();
+        let mut tail = Vec::new();
+        let LongLine::Parsed {
+            value,
+            long_strings,
+            truncated_strings,
+            ..
+        } = parse_long_line(&mut line.as_bytes(), 1024, &mut tail, 0, true)
+        else {
+            panic!("not parsed");
+        };
+        assert_eq!(truncated_strings, 0);
+        assert_eq!(long_strings.len(), 1);
+        assert_eq!(value["message"]["content"], long_string_token(0));
+        assert_eq!(value["message"]["k"], "short");
+        let want = expected["message"]["content"].as_str().unwrap();
+        assert_eq!(long_strings[0].len, want.len() as u64);
+        let mut decoded = Vec::new();
+        let mut from = &line.as_bytes()[long_strings[0].start as usize..];
+        let len = decode_string_at(&mut from, &mut |bytes: &[u8]| {
+            decoded.extend_from_slice(bytes)
+        });
+        assert_eq!(len, Some(want.len() as u64));
+        assert_eq!(decoded, want.as_bytes());
     }
 
     #[test]
@@ -897,7 +1004,7 @@ mod tests {
         let mut tail = Vec::new();
         let LongLine::Parsed {
             value, consumed, ..
-        } = parse_long_line(&mut reader, 1 << 20, &mut tail, 4096)
+        } = parse_long_line(&mut reader, 1 << 20, &mut tail, 4096, false)
         else {
             panic!("not parsed");
         };
