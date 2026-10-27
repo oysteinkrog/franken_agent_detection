@@ -2823,6 +2823,61 @@ not valid json at all
     }
 
     #[test]
+    fn answers_right_after_prompts_still_end_parts_at_the_emergency_cut() {
+        // Known gap: when every answer directly follows its prompt, no
+        // ordinary cut is allowed (the prompt may still pair with its event
+        // copy). Parts must still end at 4 times the limit, so memory stays
+        // bounded.
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let mut lines = Vec::new();
+        for turn in 0..30 {
+            lines.push(json!({"type":"response_item","timestamp":"2026-01-01T00:00:00Z",
+                "payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("prompt {turn}")}]}}));
+            lines.push(json!({"type":"response_item","timestamp":"2026-01-01T00:00:01Z",
+                "payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("answer {turn}")}]}}));
+            lines.push(json!({"type":"event_msg","timestamp":"2026-01-01T00:00:02Z",
+                "payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":turn,"output_tokens":1}}}}));
+        }
+        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        fs::write(sessions.join("rollout-adjacent.jsonl"), &text).unwrap();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let whole = CodexConnector::new().scan(&ctx).unwrap();
+
+        let max_messages = 2;
+        TEST_CODEX_PART_LIMITS.with(|limits| limits.set(Some((max_messages, usize::MAX))));
+        let mut parts = Vec::new();
+        CodexConnector::new()
+            .scan_with_callback(&ctx, &mut |conversation| {
+                parts.push(conversation);
+                Ok(())
+            })
+            .unwrap();
+        TEST_CODEX_PART_LIMITS.with(|limits| limits.set(None));
+
+        assert!(parts.len() >= 3, "{} parts", parts.len());
+        for part in &parts {
+            // The emergency cut (4x) plus the one turn it waits for.
+            assert!(
+                part.messages.len() <= 4 * max_messages + 2,
+                "part of {} messages",
+                part.messages.len()
+            );
+        }
+        let joined: Vec<&NormalizedMessage> =
+            parts.iter().flat_map(|part| part.messages.iter()).collect();
+        assert_eq!(joined.len(), whole[0].messages.len());
+        for (left, right) in joined.iter().zip(&whole[0].messages) {
+            assert_eq!(
+                (left.idx, &left.content, &left.extra),
+                (right.idx, &right.content, &right.extra)
+            );
+        }
+    }
+
+    #[test]
     fn truncated_jsonl_mid_json_requires_retry() {
         let dir = TempDir::new().unwrap();
         let codex_dir = dir.path().join(".codex");
