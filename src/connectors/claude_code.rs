@@ -953,6 +953,8 @@ struct LongLineStrings {
     file: std::io::BufReader<fs::File>,
     line_start: u64,
     strings: Vec<super::long_jsonl_line::LongString>,
+    /// The nonce in this line's tokens.
+    nonce: String,
 }
 
 enum TextPiece<'a> {
@@ -962,7 +964,7 @@ enum TextPiece<'a> {
 
 /// Split `text` into literal text and deferred-string tokens. Anything that
 /// only looks like a token (bad index) stays literal text.
-fn text_pieces(text: &str, count: usize) -> Vec<TextPiece<'_>> {
+fn text_pieces<'a>(text: &'a str, nonce: &str, count: usize) -> Vec<TextPiece<'a>> {
     use super::long_jsonl_line::{LONG_STRING_TOKEN_END, LONG_STRING_TOKEN_START};
     let mut pieces = Vec::new();
     let mut rest = text;
@@ -972,7 +974,8 @@ fn text_pieces(text: &str, count: usize) -> Vec<TextPiece<'_>> {
         let at = pos + found;
         let after = &text[at + LONG_STRING_TOKEN_START.len_utf8()..];
         let index = after
-            .strip_prefix("long-string:")
+            .strip_prefix(nonce)
+            .and_then(|tail| tail.strip_prefix(':'))
             .and_then(|tail| tail.split_once(LONG_STRING_TOKEN_END))
             .and_then(|(digits, _)| digits.parse::<usize>().ok().map(|n| (n, digits.len())))
             .filter(|&(n, _)| n < count);
@@ -983,7 +986,8 @@ fn text_pieces(text: &str, count: usize) -> Vec<TextPiece<'_>> {
             pieces.push(TextPiece::Long(n));
             let end = at
                 + LONG_STRING_TOKEN_START.len_utf8()
-                + "long-string:".len()
+                + nonce.len()
+                + 1
                 + digits
                 + LONG_STRING_TOKEN_END.len_utf8();
             literal_from = end;
@@ -1001,17 +1005,17 @@ fn text_pieces(text: &str, count: usize) -> Vec<TextPiece<'_>> {
 
 /// In fields cass does not index (invocation arguments, `extra`, snippets),
 /// a deferred string becomes a short note; its text is in the message.
-fn note_long_strings(text: &str, strings: &[super::long_jsonl_line::LongString]) -> String {
-    text_pieces(text, strings.len())
+fn note_long_strings(text: &str, strings: &LongLineStrings) -> String {
+    text_pieces(text, &strings.nonce, strings.strings.len())
         .into_iter()
         .map(|piece| match piece {
             TextPiece::Text(text) => text.to_string(),
-            TextPiece::Long(n) => format!("[long string of {} bytes]", strings[n].len),
+            TextPiece::Long(n) => format!("[long string of {} bytes]", strings.strings[n].len),
         })
         .collect()
 }
 
-fn note_long_strings_in_value(value: &mut Value, strings: &[super::long_jsonl_line::LongString]) {
+fn note_long_strings_in_value(value: &mut Value, strings: &LongLineStrings) {
     match value {
         Value::String(text) => {
             if text.contains(super::long_jsonl_line::LONG_STRING_TOKEN_START) {
@@ -1153,17 +1157,17 @@ fn expand_long_message(
     use std::io::{Seek, SeekFrom};
     for invocation in &mut message.invocations {
         if let Some(arguments) = &mut invocation.arguments {
-            note_long_strings_in_value(arguments, &strings.strings);
+            note_long_strings_in_value(arguments, strings);
         }
     }
-    note_long_strings_in_value(&mut message.extra, &strings.strings);
+    note_long_strings_in_value(&mut message.extra, strings);
     for snippet in &mut message.snippets {
         if let Some(text) = &mut snippet.snippet_text {
-            *text = note_long_strings(text, &strings.strings);
+            *text = note_long_strings(text, strings);
         }
     }
     let content = std::mem::take(&mut message.content);
-    let pieces = text_pieces(&content, strings.strings.len());
+    let pieces = text_pieces(&content, &strings.nonce, strings.strings.len());
     if !pieces
         .iter()
         .any(|piece| matches!(piece, TextPiece::Long(_)))
@@ -1222,7 +1226,9 @@ fn expand_long_message(
                 if let Some(error) = failed {
                     return Err(error);
                 }
-                if decoded != Some(long.len) {
+                // The same length and the same raw bytes as the first pass
+                // saw, or the file changed in between.
+                if decoded != Some((long.len, long.raw_blake3)) {
                     return Ok(false);
                 }
             }
@@ -1523,6 +1529,7 @@ fn parse_claude_jsonl_source(
                         truncated_strings,
                         dropped_values,
                         long_strings,
+                        token_nonce,
                     } => {
                         let line_start = offset;
                         offset += consumed;
@@ -1551,9 +1558,11 @@ fn parse_claude_jsonl_source(
                             if long_file.is_none() {
                                 long_file = fs::File::open(path)
                                     .ok()
+                                    // Where the platform gives no identity,
+                                    // the raw-byte hashes still catch a change.
                                     .filter(|f| {
-                                        file_identity.is_some()
-                                            && open_file_identity(f) == file_identity
+                                        file_identity.is_none()
+                                            || open_file_identity(f) == file_identity
                                     })
                                     .map(|f| std::io::BufReader::with_capacity(256 * 1024, f));
                             }
@@ -1566,6 +1575,7 @@ fn parse_claude_jsonl_source(
                                 file,
                                 line_start,
                                 strings: long_strings,
+                                nonce: token_nonce,
                             };
                             let chunk_bytes = message_chunk_bytes();
                             let mut matched = true;
@@ -4239,7 +4249,8 @@ mod tests {
         let mut lines: Vec<String> = (0..6).map(session_line).collect();
         // Escapes, a surrogate pair and multi-byte characters inside the long
         // string, so the second pass decodes them as serde_json does.
-        let body = r#"x \"q\" \\ \n é 😀 "#.repeat(20_000);
+        // Text that looks like a deferred-string token stays as it is.
+        let body = r#"x \"q\" \\ \n é \ud83d\ude00 \ufdd0abc:0\ufdd1 "#.repeat(20_000);
         lines[3] = session_line(3).replacen("number 3", &format!("number 3 {body}"), 1);
         write_session(&session, &lines);
         let one_shot = ClaudeCodeConnector::new()
@@ -4280,6 +4291,54 @@ mod tests {
         let tail = completion(&events).tail.clone().unwrap();
         assert_eq!(tail.offset, fs::metadata(&session).unwrap().len());
         assert_eq!(tail.next_idx, 6);
+    }
+
+    #[test]
+    fn a_long_string_that_changed_since_the_first_pass_is_not_expanded() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("line.jsonl");
+        let line = format!(
+            r#"{{"type":"user","message":{{"role":"user","content":"{}"}}}}"#,
+            "a".repeat(50_000)
+        );
+        fs::write(&path, format!("{line}\n")).unwrap();
+        let mut tail = Vec::new();
+        let super::super::long_jsonl_line::LongLine::Parsed {
+            value,
+            long_strings,
+            token_nonce,
+            ..
+        } = super::super::long_jsonl_line::parse_long_line(
+            &mut line.as_bytes(),
+            1024,
+            &mut tail,
+            0,
+            true,
+        )
+        else {
+            panic!("not parsed");
+        };
+        // Same length, other bytes: only the raw hash can tell.
+        fs::write(&path, format!("{}\n", line.replace("aaaa", "aaab"))).unwrap();
+        let mut strings = LongLineStrings {
+            file: std::io::BufReader::new(fs::File::open(&path).unwrap()),
+            line_start: 0,
+            strings: long_strings,
+            nonce: token_nonce,
+        };
+        let message = NormalizedMessage {
+            idx: 0,
+            role: "user".to_string(),
+            author: None,
+            created_at: None,
+            content: value["message"]["content"].as_str().unwrap().to_string(),
+            extra: Value::Null,
+            snippets: Vec::new(),
+            invocations: Vec::new(),
+        };
+        let matched =
+            expand_long_message(message, &mut strings, 0, 1 << 20, &mut |_| Ok(())).unwrap();
+        assert!(!matched, "a changed string is caught");
     }
 
     #[test]

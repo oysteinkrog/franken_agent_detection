@@ -132,6 +132,8 @@ const MAX_LONG_STRINGS: usize = 100_000;
 pub(crate) struct LongString {
     pub(crate) start: u64,
     pub(crate) len: u64,
+    /// blake3 of the string's raw bytes in the file, closing quote included.
+    pub(crate) raw_blake3: [u8; 32],
 }
 
 /// Start and end of the token that stands for a deferred string. Both are
@@ -139,9 +141,22 @@ pub(crate) struct LongString {
 pub(crate) const LONG_STRING_TOKEN_START: char = '\u{FDD0}';
 pub(crate) const LONG_STRING_TOKEN_END: char = '\u{FDD1}';
 
-/// The token for deferred string `index` of a line.
-pub(crate) fn long_string_token(index: usize) -> String {
-    format!("{LONG_STRING_TOKEN_START}long-string:{index}{LONG_STRING_TOKEN_END}")
+/// The token for deferred string `index` of a line. `nonce` is new for each
+/// line, so text that happens to look like a token never matches one.
+pub(crate) fn long_string_token(nonce: &str, index: usize) -> String {
+    format!("{LONG_STRING_TOKEN_START}{nonce}:{index}{LONG_STRING_TOKEN_END}")
+}
+
+/// A nonce for [`long_string_token`]: 128 bits from the standard library's
+/// randomly keyed hasher.
+fn token_nonce() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let state = std::collections::hash_map::RandomState::new();
+    let mut a = state.build_hasher();
+    a.write_u64(1);
+    let mut b = state.build_hasher();
+    b.write_u64(2);
+    format!("{:016x}{:016x}", a.finish(), b.finish())
 }
 
 /// How a streamed line ended.
@@ -157,6 +172,8 @@ pub(crate) enum LongLine {
         dropped_values: usize,
         /// Strings left in the file, in token order (with `defer` only).
         long_strings: Vec<LongString>,
+        /// The nonce in this line's tokens.
+        token_nonce: String,
     },
     /// Not valid JSON. The rest of the line was consumed (`consumed` bytes
     /// in all), so parsing can go on with the next line.
@@ -177,6 +194,37 @@ struct Source<'a, R: BufRead> {
     tail: &'a mut Vec<u8>,
     tail_cap: usize,
     last: Option<u8>,
+    /// While set, every consumed byte is hashed (see [`RawHash`]).
+    raw: Option<RawHash>,
+}
+
+/// Hash of the raw bytes of a string as they stand in the file, so the second
+/// pass can tell that it reads the same bytes the first pass checked.
+struct RawHash {
+    hasher: blake3::Hasher,
+    buf: Vec<u8>,
+}
+
+impl RawHash {
+    fn new() -> Self {
+        Self {
+            hasher: blake3::Hasher::new(),
+            buf: Vec::with_capacity(64 * 1024),
+        }
+    }
+
+    fn push(&mut self, byte: u8) {
+        self.buf.push(byte);
+        if self.buf.len() == self.buf.capacity() {
+            self.hasher.update(&self.buf);
+            self.buf.clear();
+        }
+    }
+
+    fn finish(mut self) -> [u8; 32] {
+        self.hasher.update(&self.buf);
+        *self.hasher.finalize().as_bytes()
+    }
 }
 
 enum Stop {
@@ -196,6 +244,9 @@ impl<R: BufRead> Source<'_, R> {
         self.reader.consume(1);
         self.consumed += 1;
         self.last = Some(byte);
+        if let Some(raw) = &mut self.raw {
+            raw.push(byte);
+        }
         if self.tail_cap > 0 {
             if self.tail.len() >= self.tail_cap * 2 {
                 self.tail.drain(..self.tail.len() - self.tail_cap);
@@ -255,6 +306,7 @@ struct Parser {
     /// Leave value strings that would be cut in the file (see module docs).
     defer: bool,
     long_strings: Vec<LongString>,
+    token_nonce: String,
 }
 
 impl Parser {
@@ -511,6 +563,10 @@ impl Parser {
             self.budget_left.max(small)
         };
         let start = src.consumed;
+        let may_defer = self.defer && !key && !self.discard;
+        if may_defer {
+            src.raw = Some(RawHash::new());
+        }
         let mut kept: Vec<u8> = Vec::new();
         let mut total: u64 = 0;
         let mut cut = false;
@@ -522,12 +578,19 @@ impl Parser {
                 cut = true;
             }
         })?;
-        if cut && !key && self.defer && !self.discard && self.long_strings.len() < MAX_LONG_STRINGS
-        {
+        let raw = src.raw.take();
+        if cut && may_defer && self.long_strings.len() < MAX_LONG_STRINGS {
             // Leave it in the file; the caller reads it back whole.
             self.last_string_cut = false;
-            self.long_strings.push(LongString { start, len: total });
-            return Ok(long_string_token(self.long_strings.len() - 1));
+            self.long_strings.push(LongString {
+                start,
+                len: total,
+                raw_blake3: raw.map_or([0; 32], RawHash::finish),
+            });
+            return Ok(long_string_token(
+                &self.token_nonce,
+                self.long_strings.len() - 1,
+            ));
         }
         self.last_string_cut = cut;
         if self.discard {
@@ -621,11 +684,12 @@ fn read_string_bytes<R: BufRead>(
 
 /// Decode one JSON string from `reader`, positioned just after its opening
 /// quote, handing its UTF-8 bytes to `push` in pieces. Returns the decoded
-/// length, or `None` when the bytes are not a complete, valid JSON string.
+/// length and the blake3 of the raw bytes (as [`LongString`] has them), or
+/// `None` when the bytes are not a complete, valid JSON string.
 pub(crate) fn decode_string_at<R: BufRead>(
     reader: &mut R,
     push: &mut dyn FnMut(&[u8]),
-) -> Option<u64> {
+) -> Option<(u64, [u8; 32])> {
     let mut tail = Vec::new();
     let mut src = Source {
         reader,
@@ -633,6 +697,7 @@ pub(crate) fn decode_string_at<R: BufRead>(
         tail: &mut tail,
         tail_cap: 0,
         last: None,
+        raw: Some(RawHash::new()),
     };
     let mut total = 0u64;
     read_string_bytes(&mut src, &mut |bytes: &[u8]| {
@@ -640,7 +705,7 @@ pub(crate) fn decode_string_at<R: BufRead>(
         push(bytes);
     })
     .ok()?;
-    Some(total)
+    Some((total, src.raw.take()?.finish()))
 }
 
 /// Parse one line from `reader`, which is positioned at its first byte.
@@ -659,6 +724,7 @@ pub(crate) fn parse_long_line<R: BufRead>(
         tail,
         tail_cap,
         last: None,
+        raw: None,
     };
     let mut parser = Parser {
         budget_left: keep_bytes,
@@ -675,6 +741,7 @@ pub(crate) fn parse_long_line<R: BufRead>(
         keep_bytes,
         defer,
         long_strings: Vec::new(),
+        token_nonce: if defer { token_nonce() } else { String::new() },
     };
     // A byte order mark may start the line, as in the buffered path.
     let parsed = (|| {
@@ -699,6 +766,7 @@ pub(crate) fn parse_long_line<R: BufRead>(
             truncated_strings: parser.truncated_strings,
             dropped_values: parser.dropped_values,
             long_strings: parser.long_strings,
+            token_nonce: parser.token_nonce,
         },
         Err(Stop::Eof | Stop::Io) => LongLine::Incomplete,
         Err(Stop::Invalid) => {
@@ -735,7 +803,7 @@ mod tests {
 
     #[test]
     fn deferred_strings_are_tokens_and_decode_back_from_their_offsets() {
-        let long = r#"a \"b\" \\ \n é 😀 "#.repeat(1000);
+        let long = r#"a \"b\" \\ \n é \ud83d\ude00 "#.repeat(1000);
         let line = format!(r#"{{"type":"user","message":{{"content":"{long}","k":"short"}}}}"#);
         let expected: Value = serde_json::from_str(&line).unwrap();
         let mut tail = Vec::new();
@@ -743,6 +811,7 @@ mod tests {
             value,
             long_strings,
             truncated_strings,
+            token_nonce,
             ..
         } = parse_long_line(&mut line.as_bytes(), 1024, &mut tail, 0, true)
         else {
@@ -750,7 +819,10 @@ mod tests {
         };
         assert_eq!(truncated_strings, 0);
         assert_eq!(long_strings.len(), 1);
-        assert_eq!(value["message"]["content"], long_string_token(0));
+        assert_eq!(
+            value["message"]["content"],
+            long_string_token(&token_nonce, 0)
+        );
         assert_eq!(value["message"]["k"], "short");
         let want = expected["message"]["content"].as_str().unwrap();
         assert_eq!(long_strings[0].len, want.len() as u64);
@@ -759,7 +831,11 @@ mod tests {
         let len = decode_string_at(&mut from, &mut |bytes: &[u8]| {
             decoded.extend_from_slice(bytes)
         });
-        assert_eq!(len, Some(want.len() as u64));
+        assert_eq!(
+            len,
+            Some((want.len() as u64, long_strings[0].raw_blake3)),
+            "the second pass sees the same length and raw bytes"
+        );
         assert_eq!(decoded, want.as_bytes());
     }
 
