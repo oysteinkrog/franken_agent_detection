@@ -842,6 +842,9 @@ struct ClaudeJsonlOutcome {
     messages_emitted: usize,
     resumed: bool,
     tail: Option<SourceTailState>,
+    /// Strings cut and values dropped by the long-line path. When it is not
+    /// zero the source must not be certified complete.
+    cut_values: usize,
 }
 
 fn claude_jsonl_part(
@@ -1154,6 +1157,7 @@ fn parse_claude_jsonl_source(
     let mut part_title: Option<Option<String>> = None;
     let mut conversations_emitted = 0usize;
     let mut messages_emitted = 0usize;
+    let mut cut_values = 0usize;
     let mut emit = |parser: &mut ClaudeJsonlParser,
                     part_title: Option<&Option<String>>,
                     next_idx: &mut i64|
@@ -1208,6 +1212,9 @@ fn parse_claude_jsonl_source(
                             "claude_code line longer than FAD_CLAUDE_MAX_LINE_BYTES; indexed with its text cut"
                         );
                         offset += consumed;
+                        cut_values = cut_values
+                            .saturating_add(truncated_strings)
+                            .saturating_add(dropped_values);
                         if options.wants_tail {
                             push_tail_prefix(&mut prefix, &tail_bytes);
                         }
@@ -1320,6 +1327,7 @@ fn parse_claude_jsonl_source(
         messages_emitted,
         resumed,
         tail,
+        cut_values,
     })
 }
 
@@ -1505,7 +1513,16 @@ fn scan_claude_with_callback_with_exclusions(
                     resumed = outcome.resumed,
                     "claude_code extracted messages"
                 );
-                if wants_tail {
+                if outcome.cut_values > 0 {
+                    // Text was cut to fit a size limit: never certify the
+                    // source, so a later build that keeps all of it parses
+                    // the file again.
+                    tracing::warn!(
+                        path = %path.display(),
+                        cut_values = outcome.cut_values,
+                        "claude_code source indexed with text cut; completion withheld"
+                    );
+                } else if wants_tail {
                     // Only bytes up to the pre-parse size were read, so the
                     // completion stays valid even if the file grew meanwhile;
                     // the tail state says where the next scan resumes.
@@ -3867,6 +3884,37 @@ mod tests {
                 message_key(&one_shot[0].messages[i])
             );
         }
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Complete(_))),
+            "a source with cut text is never certified complete"
+        );
+    }
+
+    #[test]
+    fn a_long_line_kept_whole_still_completes_with_a_tail() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session = claude_dir.join("session.jsonl");
+        let mut lines: Vec<String> = (0..6).map(session_line).collect();
+        let body = "x".repeat(300_000);
+        lines[3] = session_line(3).replacen("number 3", &format!("number 3 {body}"), 1);
+        write_session(&session, &lines);
+
+        // Over the line cap, but its text fits the keep budget: nothing is cut.
+        TEST_MAX_LINE_BYTES.with(|cap| cap.set(Some(4096)));
+        TEST_LONG_LINE_KEEP_BYTES.with(|keep| keep.set(Some(1 << 20)));
+        let events = scan_events(&claude_dir, |_| None);
+        TEST_MAX_LINE_BYTES.with(|cap| cap.set(None));
+        TEST_LONG_LINE_KEEP_BYTES.with(|keep| keep.set(None));
+
+        let messages: Vec<&NormalizedMessage> = parts(&events)
+            .iter()
+            .flat_map(|part| part.messages.iter())
+            .collect();
+        assert_eq!(messages.len(), 6);
+        assert!(!messages[3].content.contains("[truncated while indexing"));
         let tail = completion(&events).tail.clone().unwrap();
         assert_eq!(tail.offset, fs::metadata(&session).unwrap().len());
         assert_eq!(tail.next_idx, 6);
