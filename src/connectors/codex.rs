@@ -447,7 +447,8 @@ fn codex_part_limits() -> (usize, usize) {
 /// messages or [`CODEX_PART_MAX_CONTENT_BYTES`] of text, as Claude Code
 /// sessions are, so memory stays bounded whatever the rollout size. A part
 /// ends where a user prompt starts a turn, so a turn's token usage lands on its
-/// own assistant message; one turn four times over the limit is split inside.
+/// own assistant message; one turn four times over the limit is split inside,
+/// after the usage of one of its model steps.
 /// Parts share the external id, get consecutive idx and carry their byte range
 /// in the rollout as `metadata.part`, so cass enriches each part from its own
 /// records.
@@ -462,6 +463,9 @@ struct CodexParts {
     title: Option<Option<String>>,
     /// The record before the next one was a `token_count`.
     after_token_count: bool,
+    /// Where the current model step started: messages, content bytes and
+    /// file offset, at the record after the last `token_count`.
+    step_start: (usize, usize, u64),
 }
 
 impl CodexParts {
@@ -469,29 +473,33 @@ impl CodexParts {
     /// that record starts. Records FAD does not turn into messages (tool
     /// results, for one) count by their bytes, because cass enriches the part
     /// from them. A cut inside a turn falls right after a `token_count`
-    /// record, where a model step ends, so usage stays with its assistant
-    /// message. Only a step 8 times over the limit is cut anywhere else.
+    /// record (a run of them counts as one), where a model step ends, so
+    /// usage stays with its assistant message. Only one model step 8 times
+    /// over the limit on its own is cut anywhere else.
     fn should_cut(&mut self, messages: &[NormalizedMessage], part_end: u64, next: &Value) -> bool {
         for message in &messages[self.counted.min(messages.len())..] {
             self.content_bytes = self.content_bytes.saturating_add(message.content.len());
         }
         self.counted = messages.len();
+        let next_is_usage = is_token_count_record(next);
+        let after_step = std::mem::replace(&mut self.after_token_count, next_is_usage);
+        if after_step {
+            self.step_start = (messages.len(), self.content_bytes, part_end);
+        }
         let (max_messages, max_bytes) = codex_part_limits();
-        let record_bytes =
-            usize::try_from(part_end.saturating_sub(self.byte_start)).unwrap_or(usize::MAX);
+        let over = |since: (usize, usize, u64), times: usize| {
+            let bytes = usize::try_from(part_end.saturating_sub(since.2)).unwrap_or(usize::MAX);
+            messages.len().saturating_sub(since.0) >= max_messages.saturating_mul(times)
+                || self.content_bytes.saturating_sub(since.1) >= max_bytes.saturating_mul(times)
+                || bytes >= max_bytes.saturating_mul(times)
+        };
+        let part_start = (0, 0, self.byte_start);
         let full = messages.len() >= max_messages
             || self.content_bytes >= max_bytes
-            || record_bytes >= max_bytes.saturating_mul(2);
-        let over = |times: usize| {
-            messages.len() >= max_messages.saturating_mul(times)
-                || self.content_bytes >= max_bytes.saturating_mul(times)
-                || record_bytes >= max_bytes.saturating_mul(times)
-        };
-        let after_step =
-            std::mem::replace(&mut self.after_token_count, is_token_count_record(next));
+            || over(part_start, 2);
         (full && is_user_prompt_record(next))
-            || (over(4) && after_step)
-            || (over(8) && !is_token_count_record(next))
+            || (!next_is_usage && after_step && over(part_start, 4))
+            || (!next_is_usage && over(self.step_start, 8))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -540,6 +548,7 @@ impl CodexParts {
         self.byte_start = byte_end;
         self.counted = 0;
         self.content_bytes = 0;
+        self.step_start = (0, 0, byte_end);
         conversation
     }
 }
@@ -2724,6 +2733,70 @@ not valid json at all
             parts.iter().any(|part| part.messages.is_empty()),
             "tool results alone fill a part"
         );
+        let joined: Vec<&NormalizedMessage> =
+            parts.iter().flat_map(|part| part.messages.iter()).collect();
+        assert_eq!(joined.len(), whole[0].messages.len());
+        for (left, right) in joined.iter().zip(&whole[0].messages) {
+            assert_eq!(
+                (left.idx, &left.content, &left.extra),
+                (right.idx, &right.content, &right.extra),
+                "token usage stays on its own assistant message"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_after_a_long_step_or_a_run_of_token_counts_is_kept() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let assistant = |n: usize| {
+            json!({"type":"response_item","timestamp":"2026-01-01T00:00:01Z",
+                "payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("answer {n}")}]}})
+        };
+        let usage = |n: usize| {
+            json!({"type":"event_msg","timestamp":"2026-01-01T00:00:02Z",
+                "payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":n,"output_tokens":1}}}})
+        };
+        let mut lines = vec![
+            json!({"type":"response_item","timestamp":"2026-01-01T00:00:00Z",
+            "payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"one long turn"}]}}),
+        ];
+        // With a limit of 2 messages: a step just under the 4x cut point...
+        lines.extend((0..6).map(assistant));
+        lines.push(usage(6));
+        // ...then a longer step, a tool call and its usage.
+        lines.extend((7..16).map(assistant));
+        lines.push(
+            json!({"type":"response_item","timestamp":"2026-01-01T00:00:02Z",
+            "payload":{"type":"function_call","name":"shell","call_id":"call-1","arguments":"{}"}}),
+        );
+        lines.push(usage(16));
+        // A run of token counts at a cut point: the last one wins.
+        lines.extend((17..25).map(assistant));
+        lines.push(usage(25));
+        lines.push(usage(26));
+        lines.push(assistant(27));
+        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        fs::write(sessions.join("rollout-steps.jsonl"), &text).unwrap();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let whole = CodexConnector::new().scan(&ctx).unwrap();
+
+        TEST_CODEX_PART_LIMITS.with(|limits| limits.set(Some((2, usize::MAX))));
+        let mut parts = Vec::new();
+        CodexConnector::new()
+            .scan_with_callback(&ctx, &mut |conversation| {
+                parts.push(conversation);
+                Ok(())
+            })
+            .unwrap();
+        TEST_CODEX_PART_LIMITS.with(|limits| limits.set(None));
+
+        // Cuts fall after usage 16 and after usage 26, never between a step
+        // and its usage.
+        let sizes: Vec<usize> = parts.iter().map(|part| part.messages.len()).collect();
+        assert_eq!(sizes, vec![17, 8, 1]);
         let joined: Vec<&NormalizedMessage> =
             parts.iter().flat_map(|part| part.messages.iter()).collect();
         assert_eq!(joined.len(), whole[0].messages.len());
