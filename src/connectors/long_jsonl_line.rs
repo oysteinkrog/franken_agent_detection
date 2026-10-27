@@ -857,6 +857,7 @@ mod tests {
                     consumed,
                     truncated_strings,
                     dropped_values,
+                    ..
                 } => {
                     assert_eq!(dropped_values, 0);
                     assert_eq!(value, expected, "{line}");
