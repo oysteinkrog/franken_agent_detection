@@ -857,8 +857,13 @@ mod tests {
                     consumed,
                     truncated_strings,
                     dropped_values,
-                    ..
+                    long_strings,
+                    token_nonce,
                 } => {
+                    // Without `defer` nothing is left in the file, so there
+                    // are no tokens and no nonce.
+                    assert!(long_strings.is_empty(), "{line}");
+                    assert!(token_nonce.is_empty(), "{line}");
                     assert_eq!(dropped_values, 0);
                     assert_eq!(value, expected, "{line}");
                     assert_eq!(consumed, line.len() as u64 + 1);
