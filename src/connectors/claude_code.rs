@@ -1185,6 +1185,23 @@ fn expand_long_message(
             TextPiece::Long(n) => strings.strings[*n].len,
         })
         .sum();
+    // Check every string of this message against the first pass before any
+    // of its text goes out, so a file changed in between sends nothing. The
+    // decoding pass below checks again; a change in the short time between
+    // the two can still send some chunks, but the source is then never
+    // certified, so the next scan parses it again.
+    for piece in &pieces {
+        if let TextPiece::Long(n) = piece {
+            let long = strings.strings[*n];
+            strings
+                .file
+                .seek(SeekFrom::Start(strings.line_start + long.start))?;
+            let seen = super::long_jsonl_line::decode_string_at(&mut strings.file, &mut |_| {});
+            if seen != Some((long.len, long.raw_blake3)) {
+                return Ok(false);
+            }
+        }
+    }
     let group = blake3::hash(
         format!("long-line:{}:{index_in_line}:{total}", strings.line_start).as_bytes(),
     )
@@ -4294,6 +4311,37 @@ mod tests {
     }
 
     #[test]
+    fn text_that_looks_like_an_old_token_is_kept_next_to_a_deferred_string() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session = claude_dir.join("session.jsonl");
+        let mut lines: Vec<String> = (0..3).map(session_line).collect();
+        lines[1] = format!(
+            r#"{{"type":"assistant","timestamp":"2025-12-01T10:00:01Z","message":{{"role":"assistant","content":[{{"type":"text","text":"before ﷐long-string:0﷑ after"}},{{"type":"text","text":"{}"}}]}}}}"#,
+            "L".repeat(200_000)
+        );
+        write_session(&session, &lines);
+        let one_shot = ClaudeCodeConnector::new()
+            .scan(&ScanContext::local_default(claude_dir.clone(), None))
+            .unwrap();
+        TEST_MAX_LINE_BYTES.with(|cap| cap.set(Some(4096)));
+        TEST_LONG_LINE_KEEP_BYTES.with(|keep| keep.set(Some(8192)));
+        let events = scan_events(&claude_dir, |_| None);
+        TEST_MAX_LINE_BYTES.with(|cap| cap.set(None));
+        TEST_LONG_LINE_KEEP_BYTES.with(|keep| keep.set(None));
+        let messages: Vec<&NormalizedMessage> = parts(&events)
+            .iter()
+            .flat_map(|part| part.messages.iter())
+            .collect();
+        assert!(
+            one_shot[0].messages[1]
+                .content
+                .starts_with("before \u{fdd0}long-string:0")
+        );
+        assert_eq!(messages[1].content, one_shot[0].messages[1].content);
+    }
+
+    #[test]
     fn a_long_string_that_changed_since_the_first_pass_is_not_expanded() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("line.jsonl");
@@ -4336,9 +4384,14 @@ mod tests {
             snippets: Vec::new(),
             invocations: Vec::new(),
         };
-        let matched =
-            expand_long_message(message, &mut strings, 0, 1 << 20, &mut |_| Ok(())).unwrap();
+        let mut sent = 0;
+        let matched = expand_long_message(message, &mut strings, 0, 1000, &mut |_| {
+            sent += 1;
+            Ok(())
+        })
+        .unwrap();
         assert!(!matched, "a changed string is caught");
+        assert_eq!(sent, 0, "no text from the changed file goes out");
     }
 
     #[test]
