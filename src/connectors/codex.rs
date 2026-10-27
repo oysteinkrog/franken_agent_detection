@@ -807,6 +807,10 @@ fn scan_codex_with_hooks(
                     }
                 }
                 user_prompts.finish(&mut messages);
+                messages = messages
+                    .into_iter()
+                    .flat_map(crate::types::chunk_message)
+                    .collect();
                 crate::types::reindex_messages(&mut messages);
             } else if ext == Some("json") {
                 // Legacy single-file rollouts can be huge; enforce the
@@ -868,6 +872,10 @@ fn scan_codex_with_hooks(
                         });
                     }
                 }
+                messages = messages
+                    .into_iter()
+                    .flat_map(crate::types::chunk_message)
+                    .collect();
                 crate::types::reindex_messages(&mut messages);
             }
 
@@ -2340,6 +2348,41 @@ not valid json at all
     // =====================================================
     // Edge case tests — malformed input robustness (br-fiiv)
     // =====================================================
+
+    #[test]
+    fn a_tool_output_over_the_chunk_size_is_kept_whole_in_chunks() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let output = "o".repeat(crate::types::MESSAGE_CHUNK_BYTES + 100);
+        let lines = [
+            serde_json::json!({"type":"response_item","payload":{"role":"user","content":"run it"}}),
+            serde_json::json!({"type":"response_item","payload":{
+                "type":"function_call_output","call_id":"call_1","output":output}}),
+            serde_json::json!({"type":"response_item","payload":{"role":"assistant","content":"done"}}),
+        ];
+        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        fs::write(sessions.join("rollout-big-output.jsonl"), text).unwrap();
+
+        let convs = CodexConnector::new()
+            .scan(&ScanContext::local_default(codex_dir.clone(), None))
+            .unwrap();
+        let messages = &convs[0].messages;
+        assert_eq!(messages.len(), 4, "user, two output chunks, assistant");
+        for (i, message) in messages.iter().enumerate() {
+            assert_eq!(message.idx, i as i64);
+        }
+        let joined = format!("{}{}", messages[1].content, messages[2].content);
+        assert_eq!(joined, output);
+        assert_eq!(
+            messages[1].extra.pointer("/payload/call_id").and_then(Value::as_str),
+            Some("call_1"),
+            "chunk 0 keeps the raw record"
+        );
+        assert_eq!(messages[2].extra[crate::types::MESSAGE_CHUNK_KEY]["ordinal"], 1);
+        assert_eq!(messages[3].content, "done");
+    }
 
     #[test]
     fn truncated_jsonl_mid_json_requires_retry() {

@@ -97,6 +97,104 @@ pub fn reindex_messages(messages: &mut [NormalizedMessage]) {
     }
 }
 
+/// Largest message text kept in one message. A longer message is split into
+/// ordered chunk messages by [`chunk_message`], so no text is ever cut.
+#[cfg(feature = "connectors")]
+pub const MESSAGE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Key in `extra` that marks a chunk of a split message.
+#[cfg(feature = "connectors")]
+pub const MESSAGE_CHUNK_KEY: &str = "cass_chunk";
+
+/// Split a message whose text is over [`MESSAGE_CHUNK_BYTES`] into ordered
+/// chunk messages. See [`chunk_message_at`].
+#[cfg(feature = "connectors")]
+pub fn chunk_message(message: NormalizedMessage) -> Vec<NormalizedMessage> {
+    chunk_message_at(message, MESSAGE_CHUNK_BYTES)
+}
+
+/// Split a message whose text is over `chunk_bytes` into ordered chunks of at
+/// most `chunk_bytes` each, cut only at UTF-8 character boundaries. The chunks'
+/// texts joined in order give the original text exactly.
+///
+/// Every chunk keeps the role, author, time and idx; call this before idx is
+/// assigned, so the chunks get consecutive idx. Chunk 0 keeps the original
+/// `extra`, invocations and snippets; later chunks carry only the chunk
+/// record, so a large raw `extra` is not copied. The chunk record, under
+/// [`MESSAGE_CHUNK_KEY`] in `extra`, holds `group` (a hash of the whole text,
+/// the same for every chunk of one message), `ordinal`, `count`, the half-open
+/// byte range `byte_start..byte_end` in the whole text, and `total_bytes`.
+/// When the original `extra` is neither an object nor null, chunk 0 keeps it
+/// unchanged and has no chunk record.
+#[cfg(feature = "connectors")]
+pub fn chunk_message_at(mut message: NormalizedMessage, chunk_bytes: usize) -> Vec<NormalizedMessage> {
+    let chunk_bytes = chunk_bytes.max(4);
+    if message.content.len() <= chunk_bytes {
+        return vec![message];
+    }
+    let content = std::mem::take(&mut message.content);
+    let total = content.len();
+    let mut bounds = Vec::new();
+    let mut start = 0;
+    while start < total {
+        let mut end = (start + chunk_bytes).min(total);
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        bounds.push((start, end));
+        start = end;
+    }
+    let hash = blake3::hash(content.as_bytes()).to_hex();
+    let group = &hash.as_str()[..16];
+    let count = bounds.len();
+    let record = |ordinal: usize, (byte_start, byte_end): (usize, usize)| {
+        serde_json::json!({
+            "group": group,
+            "ordinal": ordinal,
+            "count": count,
+            "byte_start": byte_start,
+            "byte_end": byte_end,
+            "total_bytes": total,
+        })
+    };
+    let mut chunks = Vec::with_capacity(count);
+    for (ordinal, &(byte_start, byte_end)) in bounds.iter().enumerate().skip(1) {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            MESSAGE_CHUNK_KEY.to_string(),
+            record(ordinal, (byte_start, byte_end)),
+        );
+        chunks.push(NormalizedMessage {
+            idx: message.idx,
+            role: message.role.clone(),
+            author: message.author.clone(),
+            created_at: message.created_at,
+            content: content[byte_start..byte_end].to_string(),
+            extra: serde_json::Value::Object(extra),
+            snippets: Vec::new(),
+            invocations: Vec::new(),
+        });
+    }
+    let first = record(0, bounds[0]);
+    match &mut message.extra {
+        serde_json::Value::Object(map) => {
+            map.insert(MESSAGE_CHUNK_KEY.to_string(), first);
+        }
+        serde_json::Value::Null => {
+            let mut map = serde_json::Map::new();
+            map.insert(MESSAGE_CHUNK_KEY.to_string(), first);
+            message.extra = serde_json::Value::Object(map);
+        }
+        _ => {}
+    }
+    let mut content = content;
+    content.truncate(bounds[0].1);
+    content.shrink_to_fit();
+    message.content = content;
+    chunks.insert(0, message);
+    chunks
+}
+
 // -------------------------------------------------------------------------
 // Scan & provenance types (feature-gated behind `connectors`)
 // -------------------------------------------------------------------------
@@ -375,6 +473,78 @@ impl std::fmt::Display for Platform {
 #[cfg(all(test, feature = "connectors"))]
 mod tests {
     use super::*;
+
+    fn text_message(content: &str, extra: serde_json::Value) -> NormalizedMessage {
+        NormalizedMessage {
+            idx: 7,
+            role: "tool".to_string(),
+            author: Some("a".to_string()),
+            created_at: Some(1_700_000_000_000),
+            content: content.to_string(),
+            extra,
+            snippets: Vec::new(),
+            invocations: vec![NormalizedInvocation {
+                kind: "tool".to_string(),
+                name: "Read".to_string(),
+                raw_name: None,
+                call_id: Some("c1".to_string()),
+                arguments: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_short_message_is_not_chunked() {
+        let message = text_message("short", serde_json::json!({"k": 1}));
+        let chunks = chunk_message_at(message, 16);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].content, "short");
+        assert_eq!(chunks[0].extra, serde_json::json!({"k": 1}));
+    }
+
+    #[test]
+    fn chunks_rebuild_the_text_exactly_and_never_split_a_character() {
+        // 'é' is 2 bytes and '€' is 3, so 10-byte chunks must back off.
+        let text = "aé€".repeat(40);
+        let chunks = chunk_message_at(text_message(&text, serde_json::json!({"k": 1})), 10);
+        assert!(chunks.len() > 1);
+        let joined: String = chunks.iter().map(|chunk| chunk.content.as_str()).collect();
+        assert_eq!(joined, text);
+        let group = chunks[0].extra[MESSAGE_CHUNK_KEY]["group"].clone();
+        let mut next = 0;
+        for (ordinal, chunk) in chunks.iter().enumerate() {
+            assert!(chunk.content.len() <= 10);
+            assert_eq!((chunk.idx, chunk.role.as_str()), (7, "tool"));
+            assert_eq!(chunk.created_at, Some(1_700_000_000_000));
+            let record = &chunk.extra[MESSAGE_CHUNK_KEY];
+            assert_eq!(record["group"], group);
+            assert_eq!(record["ordinal"], ordinal);
+            assert_eq!(record["count"], chunks.len());
+            assert_eq!(record["total_bytes"], text.len());
+            assert_eq!(record["byte_start"], next);
+            next += chunk.content.len();
+            assert_eq!(record["byte_end"], next);
+            assert_eq!(&text[record["byte_start"].as_u64().unwrap() as usize..next], chunk.content);
+        }
+        // Chunk 0 keeps the original extra and the invocations; the rest carry
+        // only the chunk record.
+        assert_eq!(chunks[0].extra["k"], 1);
+        assert_eq!(chunks[0].invocations.len(), 1);
+        for chunk in &chunks[1..] {
+            assert_eq!(chunk.extra.as_object().unwrap().len(), 1);
+            assert!(chunk.invocations.is_empty());
+        }
+    }
+
+    #[test]
+    fn chunk_records_on_null_and_scalar_extra() {
+        let chunks = chunk_message_at(text_message(&"x".repeat(30), serde_json::Value::Null), 10);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].extra[MESSAGE_CHUNK_KEY]["ordinal"], 0);
+        let chunks = chunk_message_at(text_message(&"x".repeat(30), serde_json::json!("raw")), 10);
+        assert_eq!(chunks[0].extra, serde_json::json!("raw"));
+        assert_eq!(chunks[1].extra[MESSAGE_CHUNK_KEY]["ordinal"], 1);
+    }
 
     #[test]
     fn default_local_origin_is_local_not_remote() {

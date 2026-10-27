@@ -557,6 +557,8 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static TEST_CHUNK_LIMITS: std::cell::Cell<Option<ClaudeChunkLimits>> =
         const { std::cell::Cell::new(None) };
+    static TEST_MESSAGE_CHUNK_BYTES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Session-level state of a Claude JSONL parse: everything a later line, part
@@ -660,8 +662,12 @@ impl ClaudeJsonlParser {
         if self.state.first_user_title.is_none() && message.role == "user" {
             self.state.first_user_title = Some(first_line_title(&message.content));
         }
-        self.content_bytes = self.content_bytes.saturating_add(message.content.len());
-        self.messages.push(message);
+        // A message over the chunk size becomes ordered chunks, all pushed
+        // together, so a part never ends inside one message.
+        for chunk in crate::types::chunk_message_at(message, message_chunk_bytes()) {
+            self.content_bytes = self.content_bytes.saturating_add(chunk.content.len());
+            self.messages.push(chunk);
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -907,6 +913,14 @@ fn parse_claude_jsonl_line(bytes: &[u8]) -> Option<Value> {
 /// message is dropped.
 const DEFAULT_MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_LONG_LINE_KEEP_BYTES: usize = 16 * 1024 * 1024;
+
+fn message_chunk_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(bytes) = TEST_MESSAGE_CHUNK_BYTES.with(std::cell::Cell::get) {
+        return bytes;
+    }
+    crate::types::MESSAGE_CHUNK_BYTES
+}
 
 fn long_line_keep_bytes() -> usize {
     #[cfg(test)]
@@ -3923,6 +3937,53 @@ mod tests {
             &fs::read(&session).unwrap()[tail.offset as usize - tail.prefix.len()..],
             "the tail prefix covers the end of the long line"
         );
+    }
+
+    #[test]
+    fn a_big_message_is_split_into_chunks_and_a_tail_scan_continues_after_them() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        let session = claude_dir.join("session.jsonl");
+        let mut lines: Vec<String> = (0..4).map(session_line).collect();
+        let body = "y".repeat(100);
+        lines[1] = session_line(1).replacen("number 1", &format!("number 1 {body}"), 1);
+        write_session(&session, &lines);
+
+        TEST_MESSAGE_CHUNK_BYTES.with(|bytes| bytes.set(Some(40)));
+        let first = scan_events(&claude_dir, |_| None);
+        let first_messages: Vec<NormalizedMessage> = parts(&first)
+            .iter()
+            .flat_map(|part| part.messages.iter().cloned())
+            .collect();
+        // 1 + 3 chunks + 1 + 1
+        assert_eq!(first_messages.len(), 6);
+        for (i, message) in first_messages.iter().enumerate() {
+            assert_eq!(message.idx, i as i64);
+        }
+        let joined: String = first_messages[1..4]
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(joined, format!("message number 1 {body}"));
+        assert_eq!(first_messages[3].extra[crate::types::MESSAGE_CHUNK_KEY]["count"], 3);
+        assert_eq!(first_messages[1].role, "assistant");
+        let tail = completion(&first).tail.clone().unwrap();
+        assert_eq!(tail.next_idx, 6);
+
+        lines.push(session_line(4));
+        write_session(&session, &lines);
+        let second = scan_events(&claude_dir, |_| Some(resume_from(&tail)));
+        let fresh = scan_events(&claude_dir, |_| None);
+        TEST_MESSAGE_CHUNK_BYTES.with(|bytes| bytes.set(None));
+        let appended = &parts(&second)[0].messages;
+        assert_eq!(appended.len(), 1);
+        assert_eq!(appended[0].idx, 6);
+        let fresh_messages: Vec<&NormalizedMessage> = parts(&fresh)
+            .iter()
+            .flat_map(|part| part.messages.iter())
+            .collect();
+        assert_eq!(fresh_messages.len(), 7);
+        assert_eq!(message_key(fresh_messages[6]), message_key(&appended[0]));
     }
 
     #[test]

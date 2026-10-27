@@ -30,6 +30,10 @@ pub use types::{
     PathMapping,
     Platform,
     SourceKind,
+    MESSAGE_CHUNK_BYTES,
+    MESSAGE_CHUNK_KEY,
+    chunk_message,
+    chunk_message_at,
     reindex_messages,
 };
 // Re-export connector infrastructure at crate root.
