@@ -460,14 +460,17 @@ struct CodexParts {
     counted: usize,
     content_bytes: usize,
     title: Option<Option<String>>,
+    /// The record before the next one was a `token_count`.
+    after_token_count: bool,
 }
 
 impl CodexParts {
     /// Whether to end the part before the next record. `part_end` is where
     /// that record starts. Records FAD does not turn into messages (tool
     /// results, for one) count by their bytes, because cass enriches the part
-    /// from them. A cut inside a turn waits for a record that is no
-    /// `token_count`, so usage stays with its assistant message.
+    /// from them. A cut inside a turn falls right after a `token_count`
+    /// record, where a model step ends, so usage stays with its assistant
+    /// message. Only a step 8 times over the limit is cut anywhere else.
     fn should_cut(&mut self, messages: &[NormalizedMessage], part_end: u64, next: &Value) -> bool {
         for message in &messages[self.counted.min(messages.len())..] {
             self.content_bytes = self.content_bytes.saturating_add(message.content.len());
@@ -479,10 +482,16 @@ impl CodexParts {
         let full = messages.len() >= max_messages
             || self.content_bytes >= max_bytes
             || record_bytes >= max_bytes.saturating_mul(2);
-        let far_over = messages.len() >= max_messages.saturating_mul(4)
-            || self.content_bytes >= max_bytes.saturating_mul(4)
-            || record_bytes >= max_bytes.saturating_mul(4);
-        (full && is_user_prompt_record(next)) || (far_over && !is_token_count_record(next))
+        let over = |times: usize| {
+            messages.len() >= max_messages.saturating_mul(times)
+                || self.content_bytes >= max_bytes.saturating_mul(times)
+                || record_bytes >= max_bytes.saturating_mul(times)
+        };
+        let after_step =
+            std::mem::replace(&mut self.after_token_count, is_token_count_record(next));
+        (full && is_user_prompt_record(next))
+            || (over(4) && after_step)
+            || (over(8) && !is_token_count_record(next))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -690,16 +699,19 @@ fn scan_codex_with_hooks(
                 let mut reader = reader::RolloutReader::open(&file, ctx.progress_tick.as_deref())?;
 
                 while let Some((line_idx, val)) = reader.next_record()? {
+                    // Set before any `continue` below, so every record is
+                    // inside some part's range.
+                    let record_start = std::mem::replace(&mut part_end, reader.bytes_read());
                     let entry_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     let created = val.get("timestamp").and_then(parse_timestamp);
-                    if parts.should_cut(&messages, part_end, &val)
+                    if parts.should_cut(&messages, record_start, &val)
                         && user_prompts.can_cut_before(line_idx)
                     {
                         let part = std::mem::take(&mut messages);
                         std::mem::take(&mut user_prompts).finish_into(part, &mut |part| {
                             on_conversation(parts.conversation(
                                 part,
-                                part_end,
+                                record_start,
                                 &external_id,
                                 &session_cwd,
                                 &source_path,
@@ -980,8 +992,9 @@ fn scan_codex_with_hooks(
                         }
                         _ => {}
                     }
-                    part_end = reader.bytes_read();
                 }
+                // Blank lines after the last record belong to the last part.
+                part_end = reader.bytes_read();
                 user_prompts.finish(&mut messages);
             } else if ext == Some("json") {
                 // Legacy single-file rollouts can be huge; enforce the
@@ -2654,7 +2667,11 @@ not valid json at all
         for step in 0..12 {
             lines.push(json!({"type":"response_item","timestamp":format!("2026-01-01T00:00:{step:02}Z"),
                 "payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("step {step}")}]}}));
-            // Right where a hard cut falls (8 messages), and at other steps.
+            // A tool call between a step's answer and its usage.
+            if step % 3 == 1 {
+                lines.push(json!({"type":"response_item","timestamp":format!("2026-01-01T00:00:{step:02}Z"),
+                    "payload":{"type":"function_call","name":"shell","call_id":format!("call-{step}"),"arguments":"{}"}}));
+            }
             lines.push(json!({"type":"event_msg","timestamp":format!("2026-01-01T00:00:{step:02}Z"),
                 "payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":step,"output_tokens":1}}}}));
         }
@@ -2663,7 +2680,10 @@ not valid json at all
             lines.push(json!({"type":"event_msg","payload":{"type":"tool_result",
                 "output":format!("result {result} {}", "x".repeat(80))}}));
         }
-        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        // A last record FAD skips, then blank lines.
+        lines.push(json!({"type":"response_item","payload":{"type":"reasoning"}}));
+        let mut text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        text.push_str("\n\n");
         fs::write(sessions.join("rollout-hard.jsonl"), &text).unwrap();
         let ctx = ScanContext::local_default(codex_dir.clone(), None);
         let whole = CodexConnector::new().scan(&ctx).unwrap();
