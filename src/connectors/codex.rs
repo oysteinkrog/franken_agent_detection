@@ -440,30 +440,6 @@ fn is_token_count_record(val: &Value) -> bool {
             == Some("token_count")
 }
 
-/// A record the scan turns into a user message. Records it skips (no text)
-/// are not, so a part never ends before a record that adds nothing.
-fn is_user_prompt_record(val: &Value) -> bool {
-    let payload = val.get("payload");
-    let payload_type = payload.and_then(|p| p.get("type")).and_then(Value::as_str);
-    match val.get("type").and_then(Value::as_str) {
-        Some("response_item") => {
-            matches!(payload_type, None | Some("message"))
-                && payload.and_then(|p| p.get("role")).and_then(Value::as_str) == Some("user")
-                && payload
-                    .and_then(|p| p.get("content"))
-                    .is_some_and(|content| !flatten_content(content).trim().is_empty())
-        }
-        Some("event_msg") => {
-            payload_type == Some("user_message")
-                && payload
-                    .and_then(|p| p.get("message"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| !text.is_empty())
-        }
-        _ => false,
-    }
-}
-
 /// Default part size, as for Claude Code sessions.
 const CODEX_PART_MAX_MESSAGES: usize = 8192;
 const CODEX_PART_MAX_CONTENT_BYTES: usize = 16 * 1024 * 1024;
@@ -485,9 +461,8 @@ fn codex_part_limits() -> (usize, usize) {
 /// A long rollout is handed out in parts of about [`CODEX_PART_MAX_MESSAGES`]
 /// messages or [`CODEX_PART_MAX_CONTENT_BYTES`] of text, as Claude Code
 /// sessions are, so memory stays bounded whatever the rollout size. A part
-/// ends where a user prompt starts a turn, so a turn's token usage lands on its
-/// own assistant message; one turn four times over the limit is split inside,
-/// right before an assistant message that usage can attach to.
+/// ends right before an assistant message that token usage can attach to, so
+/// every usage record stays with the message it lands on in a whole scan.
 /// Parts share the external id, get consecutive idx and carry their byte range
 /// in the rollout as `metadata.part`, so cass enriches each part from its own
 /// records.
@@ -506,11 +481,12 @@ impl CodexParts {
     /// Whether to end the part before the next record. `part_end` is where
     /// that record starts. Records FAD does not turn into messages (tool
     /// results, for one) count by their bytes, because cass enriches the part
-    /// from them. A cut inside a turn falls right before an assistant message
-    /// that `token_count` usage attaches to: usage after it can only attach to
-    /// it or to later messages, never to the part before. Only a stretch 4
-    /// times over the limit with no such message is cut anywhere else, and
-    /// then never right before a `token_count`.
+    /// from them. A cut falls right before an assistant message that
+    /// `token_count` usage attaches to: usage after it can only attach to it
+    /// or to later messages, never to the part before. A user prompt is no
+    /// safe cut, since usage after it still lands on the answer before it.
+    /// Only a stretch 4 times over the limit with no such message is cut
+    /// anywhere else, and then never right before a `token_count`.
     fn should_cut(&mut self, messages: &[NormalizedMessage], part_end: u64, next: &Value) -> bool {
         for message in &messages[self.counted.min(messages.len())..] {
             self.content_bytes = self.content_bytes.saturating_add(message.content.len());
@@ -525,9 +501,7 @@ impl CodexParts {
                 || record_bytes >= max_bytes.saturating_mul(times)
         };
         let full = messages.len() >= max_messages || self.content_bytes >= max_bytes || over(2);
-        (full && is_user_prompt_record(next))
-            || (over(4) && is_usage_target_record(next))
-            || (over(8) && !is_token_count_record(next))
+        (full && is_usage_target_record(next)) || (over(4) && !is_token_count_record(next))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2672,9 +2646,9 @@ not valid json at all
             assert_eq!(range["ordinal"], ordinal);
             assert_eq!(range["byte_start"], next_byte);
             next_byte = range["byte_end"].as_u64().unwrap();
-            // A part starts at a user prompt (the first one after the meta).
+            // A part starts at an assistant answer.
             if ordinal > 0 {
-                assert_eq!(part.messages[0].role, "user");
+                assert_eq!(part.messages[0].role, "assistant");
             }
         }
         assert_eq!(next_byte, text.len() as u64);
@@ -2812,6 +2786,11 @@ not valid json at all
             json!({"type":"response_item","payload":{"type":"message","role":"user","content":""}}),
         );
         lines.push(usage(31));
+        // Usage after a user prompt still lands on the answer before it.
+        lines.extend((32..35).map(assistant));
+        lines.push(json!({"type":"response_item","payload":{"type":"message","role":"user","content":"Continue"}}));
+        lines.push(usage(35));
+        lines.push(assistant(36));
         let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
         fs::write(sessions.join("rollout-steps.jsonl"), &text).unwrap();
         let ctx = ScanContext::local_default(codex_dir.clone(), None);
@@ -2827,10 +2806,7 @@ not valid json at all
             .unwrap();
         TEST_CODEX_PART_LIMITS.with(|limits| limits.set(None));
 
-        // Each cut falls right before an assistant answer, once the part
-        // holds 8 messages, so no usage record is parted from its answer.
-        let sizes: Vec<usize> = parts.iter().map(|part| part.messages.len()).collect();
-        assert_eq!(sizes, vec![8, 9, 8, 3]);
+        assert!(parts.len() >= 3, "{} parts", parts.len());
         let joined: Vec<&NormalizedMessage> =
             parts.iter().flat_map(|part| part.messages.iter()).collect();
         assert_eq!(joined.len(), whole[0].messages.len());
