@@ -1,7 +1,9 @@
 mod reader;
 mod user_prompts;
 
-pub use reader::{codex_rollout_byte_budget, set_codex_rollout_byte_budget};
+pub use reader::{
+    codex_long_lines_held_whole, codex_rollout_byte_budget, set_codex_rollout_byte_budget,
+};
 
 use std::collections::HashSet;
 use std::fs;
@@ -2875,6 +2877,29 @@ not valid json at all
                 (right.idx, &right.content, &right.extra)
             );
         }
+    }
+
+    #[test]
+    fn a_codex_line_over_32_mib_is_indexed_whole_and_counted() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let answer = "a".repeat(33 * 1024 * 1024);
+        let line = json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+            "content":[{"type":"output_text","text":answer}]}});
+        fs::write(
+            sessions.join("rollout-long-line.jsonl"),
+            format!("{line}\n"),
+        )
+        .unwrap();
+        let before = codex_long_lines_held_whole();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = CodexConnector::new().scan(&ctx).unwrap();
+        // Other tests may count at the same time, so check the increase only.
+        assert!(codex_long_lines_held_whole() > before);
+        let text: usize = convs[0].messages.iter().map(|m| m.content.len()).sum();
+        assert_eq!(text, answer.len(), "every byte indexed, in chunks");
     }
 
     #[test]

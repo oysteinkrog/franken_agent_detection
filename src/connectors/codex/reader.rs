@@ -19,6 +19,20 @@ const PROGRESS_LINE_STRIDE: usize = 1024;
 /// An embedder may still set one.
 static ROLLOUT_BYTE_BUDGET: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// Lines longer than this are still read and indexed whole, unlike Claude Code
+/// lines, which stream. Each one is logged and counted, so the first real case
+/// shows up before streaming them here is built.
+const LONG_LINE_BYTES: u64 = 32 * 1024 * 1024;
+
+static LONG_LINES_HELD_WHOLE: AtomicU64 = AtomicU64::new(0);
+
+/// How many Codex lines over 32 MiB this process has read whole so far. Take
+/// the difference across a scan to count that scan's lines.
+#[must_use]
+pub fn codex_long_lines_held_whole() -> u64 {
+    LONG_LINES_HELD_WHOLE.load(Ordering::Relaxed)
+}
+
 /// Set the largest Codex rollout (bytes) the primary reader admits, process-wide.
 /// Values below one byte are treated as one byte.
 pub fn set_codex_rollout_byte_budget(bytes: u64) {
@@ -79,10 +93,25 @@ impl<'a> RolloutReader<'a> {
         if self.finished {
             return Ok(None);
         }
+        let start = self.records.bytes_read;
         let record = self
             .records
             .next_record()
             .with_context(|| format!("read Codex rollout {}", self.path.display()))?;
+        if let Some((index, _)) = &record {
+            // Blank lines before the record are counted in, which only makes
+            // the number larger.
+            let line_bytes = self.records.bytes_read - start;
+            if line_bytes > LONG_LINE_BYTES {
+                LONG_LINES_HELD_WHOLE.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    path = %self.path.display(),
+                    line = index + 1,
+                    line_bytes,
+                    "codex line over 32 MiB read whole; it is indexed, but not streamed yet"
+                );
+            }
+        }
         if record.is_none() {
             // The caller accumulates a source privately until this validated
             // EOF. Nothing from a failed source may reach its consumer sink.
